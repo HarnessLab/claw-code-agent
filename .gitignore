@@ -21,3 +21,6 @@ archive/
 # Environment files
 .env
 .env.*
+
+
+test_cases
