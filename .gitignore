@@ -1,0 +1,23 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+
+archive/
+.omx/
+.clawd-agents/
+
+# Local agent/runtime artifacts
+.claude/
+.claude.json
+.port_sessions/
+
+# Environment files
+.env
+.env.*

@@ -1,0 +1,39 @@
+.category {
+  text-align: center;
+  margin: 1rem;
+}
+
+.category-image img {
+  width: 150px;
+  height: 150px;
+  object-fit: cover;
+  border-radius: 50%;
+  border: 2px solid #ddd;
+  transition: transform 0.3s;
+}
+
+.category-image img:hover {
+  transform: scale(1.05);
+}
+
+.category-name {
+  margin-top: 0.5rem;
+  color: #333;
+  font-size: 1.1rem;
+}
+
+.category a {
+  text-decoration: none;
+  color: inherit;
+}
+
+@media (max-width: 768px) {
+  .category {
+    margin: 0.5rem;
+  }
+  
+  .category-image img {
+    width: 100px;
+    height: 100px;
+  }
+}
