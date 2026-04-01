@@ -28,7 +28,7 @@ Built on the public porting workspace from [instructkr/claw-code](https://github
 > **Goal:** Not to ship the original npm source, but to reimplement the full agent flow in Python — prompt assembly, context building, slash commands, tool calling, session persistence, and local model execution.
 
 <p align="center">
-  <img src="images/demo.gif" alt="Claw Code Agent demo" width="900" />
+  <img src="images/demo1.gif" alt="Claw Code Agent demo" width="900" />
 </p>
 
 ---
