@@ -1159,14 +1159,35 @@ class LocalCodingAgent:
             and tool_result.metadata.get('action') != 'delegate_agent'
         ):
             return None
-        return {
+        metadata = dict(tool_result.metadata)
+        entry: dict[str, object] = {
             'timestamp': datetime.now(timezone.utc).isoformat(),
             'turn_index': turn_index,
             'tool_call_id': tool_call.id,
             'tool_name': tool_call.name,
             'ok': tool_result.ok,
-            **dict(tool_result.metadata),
+            'history_entry_id': f'{turn_index}:{tool_call.id}:{tool_call.name}',
+            'result_preview': self._preview_text(tool_result.content, 220),
+            **metadata,
         }
+        action = metadata.get('action')
+        path = metadata.get('path')
+        if isinstance(path, str) and path:
+            entry['history_kind'] = 'file_change'
+            entry['changed_paths'] = [path]
+            before_sha256 = metadata.get('before_sha256')
+            if isinstance(before_sha256, str) and before_sha256:
+                entry['before_snapshot_id'] = f'{path}:{before_sha256[:12]}'
+            after_sha256 = metadata.get('after_sha256')
+            if isinstance(after_sha256, str) and after_sha256:
+                entry['after_snapshot_id'] = f'{path}:{after_sha256[:12]}'
+        elif isinstance(metadata.get('command'), str):
+            entry['history_kind'] = 'shell'
+        elif action == 'delegate_agent':
+            entry['history_kind'] = 'delegation'
+        else:
+            entry['history_kind'] = 'tool'
+        return entry
 
     def _compact_prefix_count(self, session: AgentSessionState) -> int:
         prefix_count = 0
@@ -1711,6 +1732,24 @@ class LocalCodingAgent:
         if not file_history:
             return
         replay_count = len(file_history)
+        unique_paths = sorted(
+            {
+                path
+                for entry in file_history
+                for path in (
+                    entry.get('changed_paths')
+                    if isinstance(entry.get('changed_paths'), list)
+                    else ([entry.get('path')] if isinstance(entry.get('path'), str) else [])
+                )
+                if isinstance(path, str) and path
+            }
+        )
+        snapshot_count = sum(
+            1
+            for entry in file_history
+            for key in ('before_snapshot_id', 'after_snapshot_id')
+            if isinstance(entry.get(key), str) and entry.get(key)
+        )
         for message in reversed(session.messages):
             if message.metadata.get('kind') != 'file_history_replay':
                 continue
@@ -1722,6 +1761,8 @@ class LocalCodingAgent:
             metadata={
                 'kind': 'file_history_replay',
                 'file_history_count': replay_count,
+                'file_history_unique_paths': len(unique_paths),
+                'file_history_snapshot_count': snapshot_count,
             },
             message_id=f'file_history_replay_{replay_count}',
         )
@@ -1730,16 +1771,45 @@ class LocalCodingAgent:
         self,
         file_history: tuple[dict[str, object], ...],
     ) -> str:
+        unique_paths = sorted(
+            {
+                path
+                for entry in file_history
+                for path in (
+                    entry.get('changed_paths')
+                    if isinstance(entry.get('changed_paths'), list)
+                    else ([entry.get('path')] if isinstance(entry.get('path'), str) else [])
+                )
+                if isinstance(path, str) and path
+            }
+        )
+        snapshot_count = sum(
+            1
+            for entry in file_history
+            for key in ('before_snapshot_id', 'after_snapshot_id')
+            if isinstance(entry.get(key), str) and entry.get(key)
+        )
         lines = [
             '<system-reminder>',
             'Recent file history from this saved session:',
+            f'- History entries: {len(file_history)}',
+            f'- Unique changed paths: {len(unique_paths)}',
+            f'- Snapshot ids: {snapshot_count}',
         ]
+        if unique_paths:
+            preview_paths = ', '.join(unique_paths[:4])
+            if len(unique_paths) > 4:
+                preview_paths += f', ... (+{len(unique_paths) - 4} more)'
+            lines.append(f'- Changed path preview: {preview_paths}')
         for entry in file_history[-10:]:
             action = str(entry.get('action', entry.get('tool_name', 'tool')))
             turn = entry.get('turn_index')
             path = entry.get('path')
             command = entry.get('command')
             details = [f'action={action}']
+            history_entry_id = entry.get('history_entry_id')
+            if isinstance(history_entry_id, str) and history_entry_id:
+                details.append(f'entry_id={history_entry_id}')
             if turn is not None:
                 details.append(f'turn={turn}')
             if path:
@@ -1750,12 +1820,21 @@ class LocalCodingAgent:
             if isinstance(child_session_ids, list) and child_session_ids:
                 details.append(f'child_sessions={len(child_session_ids)}')
             lines.append(f"- {'; '.join(details)}")
+            before_snapshot_id = entry.get('before_snapshot_id')
+            if isinstance(before_snapshot_id, str) and before_snapshot_id:
+                lines.append(f'  before_snapshot: {before_snapshot_id}')
+            after_snapshot_id = entry.get('after_snapshot_id')
+            if isinstance(after_snapshot_id, str) and after_snapshot_id:
+                lines.append(f'  after_snapshot: {after_snapshot_id}')
             before_preview = entry.get('before_preview')
             if isinstance(before_preview, str) and before_preview:
                 lines.append(f'  before: {before_preview}')
             after_preview = entry.get('after_preview')
             if isinstance(after_preview, str) and after_preview:
                 lines.append(f'  after: {after_preview}')
+            result_preview = entry.get('result_preview')
+            if isinstance(result_preview, str) and result_preview:
+                lines.append(f'  result: {result_preview}')
         if len(file_history) > 10:
             lines.append(f'- ... plus {len(file_history) - 10} older file-history entries')
         lines.extend(

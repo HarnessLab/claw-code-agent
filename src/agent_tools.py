@@ -121,7 +121,7 @@ def execute_tool_streaming(
         return
 
     result = tool.execute(arguments, context)
-    if name in {'list_dir', 'read_file', 'glob_search', 'grep_search'} and result.ok:
+    if result.ok and result.content and name != 'delegate_agent':
         yield from _stream_static_text_result(result)
         return
     yield ToolStreamUpdate(kind='result', result=result)
@@ -541,6 +541,9 @@ def _run_bash(arguments: dict[str, Any], context: ToolExecutionContext) -> str:
             'action': 'bash',
             'command': command,
             'exit_code': completed.returncode,
+            'stdout_preview': _snapshot_text(stdout),
+            'stderr_preview': _snapshot_text(stderr),
+            'output_preview': _snapshot_text('\n'.join(payload).strip()),
         },
     )
 
@@ -634,6 +637,8 @@ def _stream_bash(
                     'command': command,
                     'exit_code': exit_code,
                     'timed_out': True,
+                    'stdout_preview': _snapshot_text(''.join(stdout_chunks)),
+                    'stderr_preview': _snapshot_text(''.join(stderr_chunks)),
                 },
             ),
         )
@@ -659,6 +664,9 @@ def _stream_bash(
                 'command': command,
                 'exit_code': exit_code,
                 'streamed': True,
+                'stdout_preview': _snapshot_text(stdout),
+                'stderr_preview': _snapshot_text(stderr),
+                'output_preview': _snapshot_text('\n'.join(payload).strip()),
             },
         ),
     )

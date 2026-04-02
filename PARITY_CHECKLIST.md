@@ -24,12 +24,15 @@ Done:
 - [x] File history journaling for write/edit/shell tool actions
 - [x] Incremental `bash` tool-result streaming events
 - [x] Incremental tool-result streaming for read-only text tools
+- [x] Incremental tool-result streaming across the current Python text tool surface
 - [x] Mutable tool transcript updates during tool execution
 - [x] Transcript mutation history for replaced/tombstoned messages
 - [x] Assistant streaming and tool-call transcript mutation history
 - [x] Structured transcript block export for messages, tool calls, and tool results
 - [x] Resume-time file-history replay reminders
 - [x] Resume-time file-history snapshot previews for file edits
+- [x] File-history snapshot ids and replay summaries for file edits
+- [x] File-history result previews for shell and delegated-tool entries
 - [x] Truncated-response continuation flow for `finish_reason=length`
 - [x] Basic snipping of older tool/tool-call messages for context control
 - [x] Basic automatic compact-boundary insertion with preserved recent tail
@@ -69,11 +72,11 @@ Done:
 
 Missing:
 
-- [ ] Full partial tool-result streaming parity across the complete tool surface
+- [ ] Full partial tool-result streaming parity across the complete upstream/npm tool surface
 - [ ] Full rich transcript mutation behavior like the npm runtime
 - [ ] Full reasoning budgets and task budgets parity
 - [ ] Full multi-agent orchestration parity beyond sequential grouped delegation and resumed-child flows
-- [ ] Full file history snapshots and replay flows
+- [ ] Full file history snapshots and replay flows beyond the current preview/id-based implementation
 - [ ] Full executable plugin lifecycle beyond manifest-driven guidance, blocking, aliases, and virtual tools
 - [ ] Full session compaction / snipping parity beyond lineage-aware summaries and replay reminders
 - [ ] Full `QueryEngine.ts` parity

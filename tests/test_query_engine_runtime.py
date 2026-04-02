@@ -1034,3 +1034,117 @@ class QueryEngineRuntimeTests(unittest.TestCase):
         self.assertIn('## Runtime Orchestration', summary)
         self.assertIn('- group_status:completed=1', summary)
         self.assertIn('- child_stop:stop=2', summary)
+
+    def test_query_engine_runtime_summary_tracks_resumed_delegate_children(self) -> None:
+        responses = [
+            {
+                'choices': [
+                    {
+                        'message': {
+                            'role': 'assistant',
+                            'content': 'Seed child result.',
+                        },
+                        'finish_reason': 'stop',
+                    }
+                ],
+                'usage': {'prompt_tokens': 5, 'completion_tokens': 2},
+            },
+            {
+                'choices': [
+                    {
+                        'message': {
+                            'role': 'assistant',
+                            'content': 'Delegating into resumed child.',
+                            'tool_calls': [
+                                {
+                                    'id': 'call_1',
+                                    'type': 'function',
+                                    'function': {
+                                        'name': 'delegate_agent',
+                                        'arguments': '{}',
+                                    },
+                                }
+                            ],
+                        },
+                        'finish_reason': 'tool_calls',
+                    }
+                ],
+                'usage': {'prompt_tokens': 8, 'completion_tokens': 3},
+            },
+            {
+                'choices': [
+                    {
+                        'message': {
+                            'role': 'assistant',
+                            'content': 'Resumed child result.',
+                        },
+                        'finish_reason': 'stop',
+                    }
+                ],
+                'usage': {'prompt_tokens': 6, 'completion_tokens': 2},
+            },
+            {
+                'choices': [
+                    {
+                        'message': {
+                            'role': 'assistant',
+                            'content': 'Parent completed after resumed child.',
+                        },
+                        'finish_reason': 'stop',
+                    }
+                ],
+                'usage': {'prompt_tokens': 7, 'completion_tokens': 2},
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            session_dir = workspace / '.port_sessions' / 'agent'
+            with patch(
+                'src.openai_compat.request.urlopen',
+                side_effect=make_urlopen_side_effect(responses),
+            ):
+                seed_agent = LocalCodingAgent(
+                    model_config=ModelConfig(
+                        model='Qwen/Qwen3-Coder-30B-A3B-Instruct',
+                        base_url='http://127.0.0.1:8000/v1',
+                    ),
+                    runtime_config=AgentRuntimeConfig(
+                        cwd=workspace,
+                        session_directory=session_dir,
+                    ),
+                )
+                seeded = seed_agent.run('Seed the delegated child')
+                resumed_child_id = seeded.session_id or ''
+
+                delegate_arguments = json.dumps(
+                    {
+                        'subtasks': [
+                            {
+                                'label': 'resume_child',
+                                'prompt': 'Continue the delegated child.',
+                                'resume_session_id': resumed_child_id,
+                                'max_turns': 2,
+                            }
+                        ],
+                        'max_turns': 2,
+                    }
+                )
+                responses[1]['choices'][0]['message']['tool_calls'][0]['function']['arguments'] = delegate_arguments
+
+                agent = LocalCodingAgent(
+                    model_config=ModelConfig(
+                        model='Qwen/Qwen3-Coder-30B-A3B-Instruct',
+                        base_url='http://127.0.0.1:8000/v1',
+                    ),
+                    runtime_config=AgentRuntimeConfig(
+                        cwd=workspace,
+                        session_directory=session_dir,
+                    ),
+                )
+                engine = QueryEnginePort.from_runtime_agent(agent)
+                turn = engine.submit_message('Delegate into resumed child')
+                summary = engine.render_summary()
+
+        self.assertEqual(turn.output, 'Parent completed after resumed child.')
+        self.assertIn('## Runtime Orchestration', summary)
+        self.assertIn('- resumed_children=1', summary)

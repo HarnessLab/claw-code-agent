@@ -749,7 +749,76 @@ class AgentRuntimeTests(unittest.TestCase):
                 stored = load_agent_session(result.session_id or '', directory=session_dir)
         self.assertEqual(len(result.file_history), 1)
         self.assertEqual(result.file_history[0]['path'], 'out.txt')
+        self.assertEqual(result.file_history[0]['history_kind'], 'file_change')
+        self.assertIn('history_entry_id', result.file_history[0])
+        self.assertIn('after_snapshot_id', result.file_history[0])
         self.assertEqual(stored.file_history[0]['action'], 'write_file')
+        self.assertEqual(stored.file_history[0]['after_snapshot_id'], result.file_history[0]['after_snapshot_id'])
+
+    def test_agent_streams_write_file_tool_output(self) -> None:
+        responses = [
+            {
+                'choices': [
+                    {
+                        'message': {
+                            'role': 'assistant',
+                            'content': 'Creating the file.',
+                            'tool_calls': [
+                                {
+                                    'id': 'call_1',
+                                    'type': 'function',
+                                    'function': {
+                                        'name': 'write_file',
+                                        'arguments': '{"path": "out.txt", "content": "hello"}',
+                                    },
+                                }
+                            ],
+                        },
+                        'finish_reason': 'tool_calls',
+                    }
+                ],
+                'usage': {'prompt_tokens': 4, 'completion_tokens': 3},
+            },
+            {
+                'choices': [
+                    {
+                        'message': {
+                            'role': 'assistant',
+                            'content': 'Write streamed.',
+                        },
+                        'finish_reason': 'stop',
+                    }
+                ],
+                'usage': {'prompt_tokens': 5, 'completion_tokens': 2},
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            with patch('src.openai_compat.request.urlopen', side_effect=make_urlopen_side_effect(responses)):
+                agent = LocalCodingAgent(
+                    model_config=ModelConfig(
+                        model='Qwen/Qwen3-Coder-30B-A3B-Instruct',
+                        base_url='http://127.0.0.1:8000/v1',
+                    ),
+                    runtime_config=AgentRuntimeConfig(
+                        cwd=workspace,
+                        permissions=AgentPermissions(allow_file_write=True),
+                    ),
+                )
+                result = agent.run('Create out.txt')
+        self.assertEqual(result.final_output, 'Write streamed.')
+        tool_delta_events = [
+            event for event in result.events
+            if event.get('type') == 'tool_delta' and event.get('tool_name') == 'write_file'
+        ]
+        self.assertGreaterEqual(len(tool_delta_events), 1)
+        tool_message = next(
+            message for message in result.transcript
+            if message.get('role') == 'tool'
+        )
+        metadata = tool_message.get('metadata', {})
+        self.assertEqual(metadata.get('streamed'), True)
+        self.assertEqual(metadata.get('action'), 'write_file')
 
     def test_agent_streams_bash_tool_output_and_mutates_tool_transcript(self) -> None:
         responses = [
@@ -1142,8 +1211,13 @@ class AgentRuntimeTests(unittest.TestCase):
         ]
         self.assertEqual(len(replay_messages), 1)
         replay_content = replay_messages[0]['content']
+        self.assertIn('Unique changed paths: 1', replay_content)
+        self.assertIn('Snapshot ids: 2', replay_content)
+        self.assertIn('before_snapshot:', replay_content)
+        self.assertIn('after_snapshot:', replay_content)
         self.assertIn('before: hello world', replay_content)
         self.assertIn('after: hello mars', replay_content)
+        self.assertIn('result:', replay_content)
 
     def test_resume_injects_compaction_replay_reminder(self) -> None:
         responses = [
