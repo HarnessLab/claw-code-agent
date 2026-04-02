@@ -8,6 +8,8 @@ from datetime import date
 from functools import lru_cache
 from pathlib import Path
 
+from .agent_plugin_cache import load_plugin_cache_summary
+from .plugin_runtime import PluginRuntime
 from .agent_types import AgentRuntimeConfig
 
 MAX_STATUS_CHARS = 2000
@@ -30,6 +32,7 @@ class AgentContextSnapshot:
     current_date: str
     is_git_repo: bool
     is_git_worktree: bool
+    scratchpad_directory: str | None
     additional_working_directories: tuple[str, ...]
     user_context: dict[str, str]
     system_context: dict[str, str]
@@ -51,7 +54,11 @@ def set_system_prompt_injection(value: str | None) -> None:
     clear_context_caches()
 
 
-def build_context_snapshot(runtime_config: AgentRuntimeConfig) -> AgentContextSnapshot:
+def build_context_snapshot(
+    runtime_config: AgentRuntimeConfig,
+    *,
+    scratchpad_directory: Path | None = None,
+) -> AgentContextSnapshot:
     cwd = runtime_config.cwd.resolve()
     additional_dirs = tuple(
         str(path.resolve()) for path in runtime_config.additional_working_directories
@@ -64,13 +71,17 @@ def build_context_snapshot(runtime_config: AgentRuntimeConfig) -> AgentContextSn
         current_date=date.today().isoformat(),
         is_git_repo=_is_git_repo(cwd),
         is_git_worktree=_is_git_worktree(cwd),
+        scratchpad_directory=(
+            str(scratchpad_directory.resolve()) if scratchpad_directory is not None else None
+        ),
         additional_working_directories=additional_dirs,
         user_context=get_user_context(
             cwd,
             additional_dirs,
             runtime_config.disable_claude_md_discovery,
+            scratchpad_directory=scratchpad_directory,
         ),
-        system_context=get_system_context(cwd),
+        system_context=get_system_context(cwd, scratchpad_directory=scratchpad_directory),
     )
 
 
@@ -78,14 +89,20 @@ def get_git_status(cwd: Path) -> str | None:
     return _get_git_status_cached(str(cwd.resolve()))
 
 
-def get_system_context(cwd: Path) -> dict[str, str]:
-    return dict(_get_system_context_cached(str(cwd.resolve())))
+def get_system_context(
+    cwd: Path,
+    *,
+    scratchpad_directory: Path | None = None,
+) -> dict[str, str]:
+    scratchpad = str(scratchpad_directory.resolve()) if scratchpad_directory is not None else ''
+    return dict(_get_system_context_cached(str(cwd.resolve()), scratchpad))
 
 
 def get_user_context(
     cwd: Path,
     additional_working_directories: tuple[str, ...] = (),
     disable_claude_md_discovery: bool = False,
+    scratchpad_directory: Path | None = None,
 ) -> dict[str, str]:
     normalized_dirs = tuple(
         str(Path(path).resolve()) for path in additional_working_directories
@@ -95,6 +112,7 @@ def get_user_context(
             str(cwd.resolve()),
             normalized_dirs,
             disable_claude_md_discovery,
+            str(scratchpad_directory.resolve()) if scratchpad_directory is not None else '',
         )
     )
 
@@ -113,6 +131,8 @@ def render_context_report(snapshot: AgentContextSnapshot, model: str) -> str:
         f'- Is a git worktree: {snapshot.is_git_worktree}',
         f'- Current date: {snapshot.current_date}',
     ]
+    if snapshot.scratchpad_directory:
+        lines.append(f'- Scratchpad directory: {snapshot.scratchpad_directory}')
     if snapshot.additional_working_directories:
         lines.extend(
             [
@@ -137,7 +157,7 @@ def render_context_report(snapshot: AgentContextSnapshot, model: str) -> str:
 
 
 @lru_cache(maxsize=32)
-def _get_system_context_cached(cwd: str) -> dict[str, str]:
+def _get_system_context_cached(cwd: str, scratchpad_directory: str) -> dict[str, str]:
     context: dict[str, str] = {}
     git_status = _get_git_status_cached(cwd)
     if git_status is not None:
@@ -145,6 +165,8 @@ def _get_system_context_cached(cwd: str) -> dict[str, str]:
     injection = get_system_prompt_injection()
     if injection:
         context['cacheBreaker'] = f'[CACHE_BREAKER: {injection}]'
+    if scratchpad_directory:
+        context['scratchpadDirectory'] = scratchpad_directory
     return context
 
 
@@ -153,16 +175,28 @@ def _get_user_context_cached(
     cwd: str,
     additional_working_directories: tuple[str, ...],
     disable_claude_md_discovery: bool,
+    scratchpad_directory: str,
 ) -> dict[str, str]:
     context: dict[str, str] = {
         'currentDate': f"Today's date is {date.today().isoformat()}.",
     }
+    if scratchpad_directory:
+        context['scratchpad'] = (
+            'Use this session-specific scratchpad directory for temporary files instead '
+            f'of /tmp when you need throwaway workspace: {scratchpad_directory}'
+        )
     if disable_claude_md_discovery:
         return context
 
     memory_bundle = _load_memory_bundle(Path(cwd), additional_working_directories)
     if memory_bundle:
         context['claudeMd'] = memory_bundle
+    plugin_cache = load_plugin_cache_summary(Path(cwd), additional_working_directories)
+    if plugin_cache:
+        context['pluginCache'] = plugin_cache
+    plugin_runtime = PluginRuntime.from_workspace(Path(cwd), additional_working_directories)
+    if plugin_runtime.manifests:
+        context['pluginRuntime'] = plugin_runtime.render_summary()
     return context
 
 

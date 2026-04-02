@@ -20,6 +20,7 @@ class PromptContext:
     current_date: str
     is_git_repo: bool
     is_git_worktree: bool
+    scratchpad_directory: str | None = None
     additional_working_directories: tuple[str, ...] = ()
     user_context: dict[str, str] = field(default_factory=dict)
     system_context: dict[str, str] = field(default_factory=dict)
@@ -29,6 +30,7 @@ def build_prompt_context(
     runtime_config: AgentRuntimeConfig,
     model_config: ModelConfig,
     additional_working_directories: tuple[str, ...] = (),
+    scratchpad_directory: Path | None = None,
 ) -> PromptContext:
     merged_directories = tuple(runtime_config.additional_working_directories)
     for raw_path in additional_working_directories:
@@ -39,7 +41,10 @@ def build_prompt_context(
         runtime_config,
         additional_working_directories=merged_directories,
     )
-    snapshot = build_context_snapshot(context_runtime)
+    snapshot = build_context_snapshot(
+        context_runtime,
+        scratchpad_directory=scratchpad_directory,
+    )
     return PromptContext(
         cwd=snapshot.cwd,
         model=model_config.model,
@@ -49,6 +54,7 @@ def build_prompt_context(
         current_date=snapshot.current_date,
         is_git_repo=snapshot.is_git_repo,
         is_git_worktree=snapshot.is_git_worktree,
+        scratchpad_directory=snapshot.scratchpad_directory,
         additional_working_directories=snapshot.additional_working_directories,
         user_context=snapshot.user_context,
         system_context=snapshot.system_context,
@@ -84,6 +90,7 @@ def build_system_prompt_parts(
         get_doing_tasks_section(),
         get_actions_section(),
         get_using_your_tools_section(enabled_tool_names),
+        get_plugin_guidance_section(prompt_context),
         get_tone_and_style_section(),
         get_output_efficiency_section(),
         SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
@@ -186,6 +193,20 @@ def get_tone_and_style_section() -> str:
     return '\n'.join(['# Tone and style', *prepend_bullets(items)])
 
 
+def get_plugin_guidance_section(prompt_context: PromptContext) -> str:
+    plugin_cache = prompt_context.user_context.get('pluginCache')
+    plugin_runtime = prompt_context.user_context.get('pluginRuntime')
+    if not plugin_cache and not plugin_runtime:
+        return ''
+    items = [
+        'Local plugin runtime data may be available in the injected user context.',
+        'Use cached plugin information as advisory runtime context, not as proof that a plugin executed successfully.',
+        'Manifest-based plugin runtime data can hint at plugin tools and hooks that may exist in the workspace.',
+        'When a task depends on plugin behavior, prefer verifying against files or explicit tool results before making strong claims.',
+    ]
+    return '\n'.join(['# Plugins', *prepend_bullets(items)])
+
+
 def get_output_efficiency_section() -> str:
     return """# Communicating with the user
 
@@ -222,6 +243,8 @@ def compute_simple_env_info(prompt_context: PromptContext) -> str:
     if prompt_context.additional_working_directories:
         items.append('Additional working directories:')
         items.append(list(prompt_context.additional_working_directories))
+    if prompt_context.scratchpad_directory:
+        items.append(f'Session scratchpad directory: {prompt_context.scratchpad_directory}')
     items.extend(
         [
             f'Platform: {prompt_context.platform_name}',

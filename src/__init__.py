@@ -8,12 +8,14 @@ from .agent_context import (
     get_user_context,
     set_system_prompt_injection,
 )
+from .agent_manager import AgentManager
 from .agent_runtime import LocalCodingAgent
 from .agent_session import AgentMessage, AgentSessionState
 from .agent_tools import build_tool_context, default_tool_registry, execute_tool
 from .agent_types import AgentPermissions, AgentRunResult, AgentRuntimeConfig, ModelConfig
 from .commands import PORTED_COMMANDS, build_command_backlog
 from .parity_audit import ParityAuditResult, run_parity_audit
+from .plugin_runtime import PluginRuntime
 from .port_manifest import PortManifest, build_port_manifest
 from .query_engine import QueryEnginePort, TurnResult
 from .runtime import PortRuntime, RuntimeSession
@@ -23,6 +25,7 @@ from .tools import PORTED_TOOLS, build_tool_backlog
 
 __all__ = [
     'AgentContextSnapshot',
+    'AgentManager',
     'AgentPermissions',
     'AgentRunResult',
     'AgentRuntimeConfig',
@@ -33,6 +36,7 @@ __all__ = [
     'ParityAuditResult',
     'PortManifest',
     'PortRuntime',
+    'PluginRuntime',
     'QueryEnginePort',
     'RuntimeSession',
     'StoredSession',

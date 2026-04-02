@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+import selectors
 import subprocess
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator, Union
 
 from .agent_types import AgentPermissions, AgentRuntimeConfig, ToolExecutionResult
 
@@ -26,7 +29,10 @@ class ToolExecutionContext:
     permissions: AgentPermissions
 
 
-ToolHandler = Callable[[dict[str, Any], ToolExecutionContext], str]
+ToolHandler = Callable[
+    [dict[str, Any], ToolExecutionContext],
+    Union[str, tuple[str, dict[str, Any]]],
+]
 
 
 @dataclass(frozen=True)
@@ -48,10 +54,23 @@ class AgentTool:
 
     def execute(self, arguments: dict[str, Any], context: ToolExecutionContext) -> ToolExecutionResult:
         try:
-            content = self.handler(arguments, context)
-            return ToolExecutionResult(name=self.name, ok=True, content=content)
+            result = self.handler(arguments, context)
+            if isinstance(result, tuple):
+                content, metadata = result
+            else:
+                content, metadata = result, {}
+            return ToolExecutionResult(name=self.name, ok=True, content=content, metadata=metadata)
         except (ToolPermissionError, ToolExecutionError, OSError, subprocess.SubprocessError) as exc:
             return ToolExecutionResult(name=self.name, ok=False, content=str(exc))
+
+
+@dataclass(frozen=True)
+class ToolStreamUpdate:
+    kind: str
+    content: str = ''
+    stream: str | None = None
+    result: ToolExecutionResult | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 def build_tool_context(config: AgentRuntimeConfig) -> ToolExecutionContext:
@@ -77,6 +96,35 @@ def execute_tool(
             content=f'Unknown tool: {name}',
         )
     return tool.execute(arguments, context)
+
+
+def execute_tool_streaming(
+    tool_registry: dict[str, AgentTool],
+    name: str,
+    arguments: dict[str, Any],
+    context: ToolExecutionContext,
+) -> Iterator[ToolStreamUpdate]:
+    tool = tool_registry.get(name)
+    if tool is None:
+        yield ToolStreamUpdate(
+            kind='result',
+            result=ToolExecutionResult(
+                name=name,
+                ok=False,
+                content=f'Unknown tool: {name}',
+            ),
+        )
+        return
+
+    if name == 'bash':
+        yield from _stream_bash(arguments, context)
+        return
+
+    result = tool.execute(arguments, context)
+    if name in {'list_dir', 'read_file', 'glob_search', 'grep_search'} and result.ok:
+        yield from _stream_static_text_result(result)
+        return
+    yield ToolStreamUpdate(kind='result', result=result)
 
 
 def default_tool_registry() -> dict[str, AgentTool]:
@@ -174,6 +222,38 @@ def default_tool_registry() -> dict[str, AgentTool]:
             },
             handler=_run_bash,
         ),
+        AgentTool(
+            name='delegate_agent',
+            description='Delegate a subtask to a nested Python coding agent and return its summary.',
+            parameters={
+                'type': 'object',
+                'properties': {
+                    'prompt': {'type': 'string'},
+                    'subtasks': {
+                        'type': 'array',
+                        'items': {
+                            'oneOf': [
+                                {'type': 'string'},
+                                {
+                                    'type': 'object',
+                                    'properties': {
+                                        'prompt': {'type': 'string'},
+                                        'label': {'type': 'string'},
+                                        'max_turns': {'type': 'integer', 'minimum': 1, 'maximum': 20},
+                                    },
+                                    'required': ['prompt'],
+                                },
+                            ]
+                        },
+                    },
+                    'max_turns': {'type': 'integer', 'minimum': 1, 'maximum': 20},
+                    'allow_write': {'type': 'boolean'},
+                    'allow_shell': {'type': 'boolean'},
+                    'include_parent_context': {'type': 'boolean'},
+                },
+            },
+            handler=_delegate_agent_placeholder,
+        ),
     ]
     return {tool.name: tool for tool in tools}
 
@@ -184,6 +264,8 @@ def serialize_tool_result(result: ToolExecutionResult) -> str:
         'ok': result.ok,
         'content': result.content,
     }
+    if result.metadata:
+        payload['metadata'] = result.metadata
     return json.dumps(payload, ensure_ascii=True, indent=2)
 
 
@@ -193,6 +275,13 @@ def _truncate_output(text: str, limit: int) -> str:
     head = text[: limit // 2]
     tail = text[-(limit // 2) :]
     return f'{head}\n...[truncated]...\n{tail}'
+
+
+def _snapshot_text(text: str, limit: int = 240) -> str:
+    normalized = ' '.join(text.split())
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: limit - 3] + '...'
 
 
 def _require_string(arguments: dict[str, Any], key: str) -> str:
@@ -304,10 +393,34 @@ def _write_file(arguments: dict[str, Any], context: ToolExecutionContext) -> str
     content = arguments.get('content')
     if not isinstance(content, str):
         raise ToolExecutionError('content must be a string')
+    previous_text: str | None = None
+    previous_sha256: str | None = None
+    if target.exists() and target.is_file():
+        previous_text = target.read_text(encoding='utf-8', errors='replace')
+        previous_sha256 = hashlib.sha256(previous_text.encode('utf-8')).hexdigest()
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(content, encoding='utf-8')
     rel = target.relative_to(context.root)
-    return f'wrote {rel} ({len(content)} chars)'
+    new_sha256 = hashlib.sha256(content.encode('utf-8')).hexdigest()
+    return (
+        f'wrote {rel} ({len(content)} chars)',
+        {
+            'action': 'write_file',
+            'path': str(rel),
+            'before_exists': previous_text is not None,
+            'before_sha256': previous_sha256,
+            'before_size': len(previous_text) if previous_text is not None else 0,
+            'before_preview': (
+                _snapshot_text(previous_text)
+                if previous_text is not None
+                else None
+            ),
+            'after_sha256': new_sha256,
+            'after_size': len(content),
+            'after_preview': _snapshot_text(content),
+            'content_length': len(content),
+        },
+    )
 
 
 def _edit_file(arguments: dict[str, Any], context: ToolExecutionContext) -> str:
@@ -332,11 +445,28 @@ def _edit_file(arguments: dict[str, Any], context: ToolExecutionContext) -> str:
         raise ToolExecutionError(
             f'old_text matched {occurrences} times; pass replace_all=true to replace every match'
         )
+    before_sha256 = hashlib.sha256(current.encode('utf-8')).hexdigest()
     updated = current.replace(old_text, new_text) if replace_all else current.replace(old_text, new_text, 1)
     target.write_text(updated, encoding='utf-8')
     rel = target.relative_to(context.root)
     replaced = occurrences if replace_all else 1
-    return f'edited {rel}; replaced {replaced} occurrence(s)'
+    after_sha256 = hashlib.sha256(updated.encode('utf-8')).hexdigest()
+    return (
+        f'edited {rel}; replaced {replaced} occurrence(s)',
+        {
+            'action': 'edit_file',
+            'path': str(rel),
+            'before_sha256': before_sha256,
+            'after_sha256': after_sha256,
+            'before_size': len(current),
+            'after_size': len(updated),
+            'before_preview': _snapshot_text(current),
+            'after_preview': _snapshot_text(updated),
+            'old_text_preview': _snapshot_text(old_text),
+            'new_text_preview': _snapshot_text(new_text),
+            'replaced_occurrences': replaced,
+        },
+    )
 
 
 def _glob_search(arguments: dict[str, Any], context: ToolExecutionContext) -> str:
@@ -400,4 +530,199 @@ def _run_bash(arguments: dict[str, Any], context: ToolExecutionContext) -> str:
         '[stderr]',
         stderr.rstrip(),
     ]
-    return _truncate_output('\n'.join(payload).strip(), context.max_output_chars)
+    return (
+        _truncate_output('\n'.join(payload).strip(), context.max_output_chars),
+        {
+            'action': 'bash',
+            'command': command,
+            'exit_code': completed.returncode,
+        },
+    )
+
+
+def _stream_bash(
+    arguments: dict[str, Any],
+    context: ToolExecutionContext,
+) -> Iterator[ToolStreamUpdate]:
+    try:
+        command = _require_string(arguments, 'command')
+        _ensure_shell_allowed(command, context)
+        process = subprocess.Popen(
+            command,
+            shell=True,
+            executable='/bin/bash',
+            cwd=context.root,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+    except (ToolPermissionError, ToolExecutionError, OSError, subprocess.SubprocessError) as exc:
+        yield ToolStreamUpdate(
+            kind='result',
+            result=ToolExecutionResult(name='bash', ok=False, content=str(exc)),
+        )
+        return
+
+    selector = selectors.DefaultSelector()
+    stdout_chunks: list[str] = []
+    stderr_chunks: list[str] = []
+    if process.stdout is not None:
+        selector.register(process.stdout, selectors.EVENT_READ, data='stdout')
+    if process.stderr is not None:
+        selector.register(process.stderr, selectors.EVENT_READ, data='stderr')
+
+    deadline = time.monotonic() + context.command_timeout_seconds
+    timeout_error: str | None = None
+
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timeout_error = (
+                    f'Command timed out after {context.command_timeout_seconds:.1f}s: {command}'
+                )
+                process.kill()
+                break
+            events = selector.select(timeout=min(remaining, 0.1))
+            if not events and process.poll() is not None:
+                _drain_registered_streams(selector, stdout_chunks, stderr_chunks)
+                break
+            for key, _ in events:
+                stream_name = str(key.data)
+                line = key.fileobj.readline()
+                if line == '':
+                    try:
+                        selector.unregister(key.fileobj)
+                    except Exception:
+                        pass
+                    try:
+                        key.fileobj.close()
+                    except Exception:
+                        pass
+                    continue
+                if stream_name == 'stdout':
+                    stdout_chunks.append(line)
+                else:
+                    stderr_chunks.append(line)
+                yield ToolStreamUpdate(
+                    kind='delta',
+                    content=line,
+                    stream=stream_name,
+                )
+    finally:
+        try:
+            selector.close()
+        except Exception:
+            pass
+
+    exit_code = process.wait()
+    if timeout_error is not None:
+        yield ToolStreamUpdate(
+            kind='result',
+            result=ToolExecutionResult(
+                name='bash',
+                ok=False,
+                content=timeout_error,
+                metadata={
+                    'action': 'bash',
+                    'command': command,
+                    'exit_code': exit_code,
+                    'timed_out': True,
+                },
+            ),
+        )
+        return
+
+    stdout = ''.join(stdout_chunks)
+    stderr = ''.join(stderr_chunks)
+    payload = [
+        f'exit_code={exit_code}',
+        '[stdout]',
+        stdout.rstrip(),
+        '[stderr]',
+        stderr.rstrip(),
+    ]
+    yield ToolStreamUpdate(
+        kind='result',
+        result=ToolExecutionResult(
+            name='bash',
+            ok=True,
+            content=_truncate_output('\n'.join(payload).strip(), context.max_output_chars),
+            metadata={
+                'action': 'bash',
+                'command': command,
+                'exit_code': exit_code,
+                'streamed': True,
+            },
+        ),
+    )
+
+
+def _delegate_agent_placeholder(
+    arguments: dict[str, Any],
+    context: ToolExecutionContext,
+) -> str:
+    raise ToolExecutionError(
+        'delegate_agent must be handled by the runtime and is not available as a standalone tool handler'
+    )
+
+
+def _drain_registered_streams(
+    selector: selectors.BaseSelector,
+    stdout_chunks: list[str],
+    stderr_chunks: list[str],
+) -> None:
+    for key in list(selector.get_map().values()):
+        try:
+            remainder = key.fileobj.read()
+        except Exception:
+            remainder = ''
+        if not remainder:
+            try:
+                selector.unregister(key.fileobj)
+            except Exception:
+                pass
+            try:
+                key.fileobj.close()
+            except Exception:
+                pass
+            continue
+        if key.data == 'stdout':
+            stdout_chunks.append(remainder)
+        else:
+            stderr_chunks.append(remainder)
+        try:
+            selector.unregister(key.fileobj)
+        except Exception:
+            pass
+        try:
+            key.fileobj.close()
+        except Exception:
+            pass
+
+
+def _stream_static_text_result(
+    result: ToolExecutionResult,
+    *,
+    chunk_size: int = 400,
+) -> Iterator[ToolStreamUpdate]:
+    content = result.content
+    if content:
+        for start in range(0, len(content), chunk_size):
+            yield ToolStreamUpdate(
+                kind='delta',
+                content=content[start:start + chunk_size],
+                stream='tool',
+            )
+    metadata = dict(result.metadata)
+    metadata.setdefault('streamed', True)
+    yield ToolStreamUpdate(
+        kind='result',
+        result=ToolExecutionResult(
+            name=result.name,
+            ok=result.ok,
+            content=result.content,
+            metadata=metadata,
+        ),
+    )

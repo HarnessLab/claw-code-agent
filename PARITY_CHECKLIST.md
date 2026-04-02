@@ -2,7 +2,7 @@
 
 This document tracks what is already implemented in Python and what is still missing compared with the upstream npm runtime.
 
-This is a functionality-oriented checklist, not a line-by-line source equivalence claim. Large parts of the mirrored Python workspace still act as inventory or scaffolding, while the working Python runtime currently lives mainly in [`src/agent_runtime.py`](src/agent_runtime.py), [`src/agent_tools.py`](src/agent_tools.py), [`src/agent_prompting.py`](src/agent_prompting.py), [`src/agent_context.py`](src/agent_context.py), [`src/agent_slash_commands.py`](src/agent_slash_commands.py), and [`src/openai_compat.py`](src/openai_compat.py).
+This is a functionality-oriented checklist, not a line-by-line source equivalence claim. Large parts of the mirrored Python workspace still act as inventory or scaffolding, while the working Python runtime currently lives mainly in [`src/agent_runtime.py`](src/agent_runtime.py), [`src/query_engine.py`](src/query_engine.py), [`src/agent_tools.py`](src/agent_tools.py), [`src/agent_prompting.py`](src/agent_prompting.py), [`src/agent_context.py`](src/agent_context.py), [`src/agent_manager.py`](src/agent_manager.py), [`src/plugin_runtime.py`](src/plugin_runtime.py), [`src/agent_slash_commands.py`](src/agent_slash_commands.py), and [`src/openai_compat.py`](src/openai_compat.py).
 
 ## 1. Core Agent Runtime
 
@@ -10,6 +10,7 @@ Done:
 
 - [x] One-shot agent loop with iterative tool calling
 - [x] OpenAI-compatible `chat/completions` client
+- [x] Streaming token-by-token assistant output
 - [x] Local-model execution against `vLLM`
 - [x] Local-model execution through `Ollama`
 - [x] Local-model execution through `LiteLLM Proxy`
@@ -17,20 +18,47 @@ Done:
 - [x] Session save and resume support
 - [x] Configurable max-turn execution
 - [x] Permission-aware tool execution
+- [x] Structured output / JSON schema request mode
+- [x] Cost tracking and usage budget enforcement
+- [x] Scratchpad directory integration
+- [x] File history journaling for write/edit/shell tool actions
+- [x] Incremental `bash` tool-result streaming events
+- [x] Incremental tool-result streaming for read-only text tools
+- [x] Mutable tool transcript updates during tool execution
+- [x] Transcript mutation history for replaced/tombstoned messages
+- [x] Structured transcript block export for messages, tool calls, and tool results
+- [x] Resume-time file-history replay reminders
+- [x] Resume-time file-history snapshot previews for file edits
+- [x] Truncated-response continuation flow for `finish_reason=length`
+- [x] Basic snipping of older tool/tool-call messages for context control
+- [x] Basic automatic compact-boundary insertion with preserved recent tail
+- [x] Reactive compaction retry after prompt-too-long backend failures
+- [x] Reasoning-token budget enforcement
+- [x] Tool-call and delegated-task budget enforcement
+- [x] Basic nested-agent delegation tool
+- [x] Sequential multi-subtask delegation with parent-context carryover
+- [x] Basic agent-manager lineage tracking for nested agents
+- [x] Managed agent-group membership tracking with child indices
+- [x] Plugin-cache discovery and prompt-context injection
+- [x] Manifest-based plugin runtime discovery
+- [x] Manifest-defined plugin hooks for before-prompt and after-turn runtime injection
+- [x] Manifest-defined plugin tool aliases over base runtime tools
+- [x] Manifest-defined plugin tool blocking
+- [x] Manifest-defined plugin tool-result guidance injected back into the transcript
+- [x] Compaction metadata with compacted message ids
+- [x] Resume-time compaction / snipping replay reminder
+- [x] Query-engine facade that can drive the real Python runtime agent
+- [x] Query-engine runtime event counters and transcript-kind summaries
 
 Missing:
 
-- [ ] Streaming token-by-token assistant output
-- [ ] Partial tool-result streaming
-- [ ] Rich transcript mutation behavior like the npm runtime
-- [ ] Structured output / JSON schema response modes
-- [ ] Reasoning budgets and task budgets
-- [ ] Cost accounting and usage budget enforcement
-- [ ] Multi-agent orchestration parity
-- [ ] File history snapshots and replay flows
-- [ ] Scratchpad integration
-- [ ] Plugin cache integration in the query engine
-- [ ] Session compaction / snipping behavior
+- [ ] Full partial tool-result streaming parity across the complete tool surface
+- [ ] Full rich transcript mutation behavior like the npm runtime
+- [ ] Full reasoning budgets and task budgets parity
+- [ ] Full multi-agent orchestration parity
+- [ ] Full file history snapshots and replay flows
+- [ ] Full executable plugin lifecycle beyond runtime guidance, blocking, and aliases
+- [ ] Full session compaction / snipping parity
 - [ ] Full `QueryEngine.ts` parity
 
 ## 2. CLI Entrypoints And Runtime Modes
@@ -98,6 +126,8 @@ Done:
 - [x] Extra directory injection through `--add-dir`
 - [x] Session context usage report
 - [x] Raw context inspection command
+- [x] Plugin cache snapshot injection
+- [x] Manifest-based plugin runtime summary injection
 
 Missing:
 

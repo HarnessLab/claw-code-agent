@@ -4,9 +4,17 @@ import argparse
 import os
 from pathlib import Path
 from dataclasses import replace
+import json
 
 from .agent_runtime import LocalCodingAgent
-from .agent_types import AgentPermissions, AgentRuntimeConfig, ModelConfig
+from .agent_types import (
+    AgentPermissions,
+    AgentRuntimeConfig,
+    BudgetConfig,
+    ModelConfig,
+    ModelPricing,
+    OutputSchemaConfig,
+)
 from .bootstrap_graph import build_bootstrap_graph
 from .command_graph import build_command_graph
 from .commands import execute_command, get_command, get_commands, render_command_index
@@ -36,12 +44,29 @@ def _add_agent_common_args(parser: argparse.ArgumentParser, *, include_backend: 
         parser.add_argument('--api-key', default=os.environ.get('OPENAI_API_KEY', 'local-token'))
         parser.add_argument('--temperature', type=float, default=0.0)
         parser.add_argument('--timeout-seconds', type=float, default=120.0)
+        parser.add_argument('--input-cost-per-million', type=float, default=0.0)
+        parser.add_argument('--output-cost-per-million', type=float, default=0.0)
     parser.add_argument('--cwd', default='.')
     parser.add_argument('--add-dir', action='append', default=[])
     parser.add_argument('--disable-claude-md', action='store_true')
     parser.add_argument('--allow-write', action='store_true')
     parser.add_argument('--allow-shell', action='store_true')
     parser.add_argument('--unsafe', action='store_true')
+    parser.add_argument('--stream', action='store_true')
+    parser.add_argument('--auto-snip-threshold', type=int)
+    parser.add_argument('--auto-compact-threshold', type=int)
+    parser.add_argument('--compact-preserve-messages', type=int, default=4)
+    parser.add_argument('--max-total-tokens', type=int)
+    parser.add_argument('--max-input-tokens', type=int)
+    parser.add_argument('--max-output-tokens', type=int)
+    parser.add_argument('--max-reasoning-tokens', type=int)
+    parser.add_argument('--max-budget-usd', type=float)
+    parser.add_argument('--max-tool-calls', type=int)
+    parser.add_argument('--max-delegated-tasks', type=int)
+    parser.add_argument('--response-schema-file')
+    parser.add_argument('--response-schema-name')
+    parser.add_argument('--response-schema-strict', action='store_true')
+    parser.add_argument('--scratchpad-root')
     parser.add_argument('--system-prompt')
     parser.add_argument('--append-system-prompt')
     parser.add_argument('--override-system-prompt')
@@ -56,9 +81,28 @@ def _build_runtime_config(args: argparse.Namespace) -> AgentRuntimeConfig:
             allow_shell_commands=args.allow_shell,
             allow_destructive_shell_commands=args.unsafe,
         ),
+        stream_model_responses=bool(getattr(args, 'stream', False)),
+        auto_snip_threshold_tokens=getattr(args, 'auto_snip_threshold', None),
+        auto_compact_threshold_tokens=getattr(args, 'auto_compact_threshold', None),
+        compact_preserve_messages=max(0, int(getattr(args, 'compact_preserve_messages', 4))),
         additional_working_directories=tuple(Path(path).resolve() for path in args.add_dir),
         disable_claude_md_discovery=args.disable_claude_md,
+        budget_config=BudgetConfig(
+            max_total_tokens=getattr(args, 'max_total_tokens', None),
+            max_input_tokens=getattr(args, 'max_input_tokens', None),
+            max_output_tokens=getattr(args, 'max_output_tokens', None),
+            max_reasoning_tokens=getattr(args, 'max_reasoning_tokens', None),
+            max_total_cost_usd=getattr(args, 'max_budget_usd', None),
+            max_tool_calls=getattr(args, 'max_tool_calls', None),
+            max_delegated_tasks=getattr(args, 'max_delegated_tasks', None),
+        ),
+        output_schema=_load_output_schema_config(args),
         session_directory=(Path('.port_sessions') / 'agent').resolve(),
+        scratchpad_root=(
+            Path(getattr(args, 'scratchpad_root')).resolve()
+            if getattr(args, 'scratchpad_root', None)
+            else (Path('.port_sessions') / 'scratchpad').resolve()
+        ),
     )
 
 
@@ -69,6 +113,29 @@ def _build_model_config(args: argparse.Namespace) -> ModelConfig:
         api_key=getattr(args, 'api_key', os.environ.get('OPENAI_API_KEY', 'local-token')),
         temperature=getattr(args, 'temperature', 0.0),
         timeout_seconds=getattr(args, 'timeout_seconds', 120.0),
+        pricing=ModelPricing(
+            input_cost_per_million_tokens_usd=float(
+                getattr(args, 'input_cost_per_million', 0.0) or 0.0
+            ),
+            output_cost_per_million_tokens_usd=float(
+                getattr(args, 'output_cost_per_million', 0.0) or 0.0
+            ),
+        ),
+    )
+
+
+def _load_output_schema_config(args: argparse.Namespace) -> OutputSchemaConfig | None:
+    schema_file = getattr(args, 'response_schema_file', None)
+    if not schema_file:
+        return None
+    payload = json.loads(Path(schema_file).read_text(encoding='utf-8'))
+    if not isinstance(payload, dict):
+        raise ValueError('response schema file must contain a top-level JSON object')
+    name = getattr(args, 'response_schema_name', None) or Path(schema_file).stem
+    return OutputSchemaConfig(
+        name=name,
+        schema=payload,
+        strict=bool(getattr(args, 'response_schema_strict', False)),
     )
 
 
@@ -92,9 +159,26 @@ def _add_agent_resume_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument('--api-key')
     parser.add_argument('--temperature', type=float)
     parser.add_argument('--timeout-seconds', type=float)
+    parser.add_argument('--input-cost-per-million', type=float)
+    parser.add_argument('--output-cost-per-million', type=float)
     parser.add_argument('--allow-write', action='store_true')
     parser.add_argument('--allow-shell', action='store_true')
     parser.add_argument('--unsafe', action='store_true')
+    parser.add_argument('--stream', action='store_true')
+    parser.add_argument('--auto-snip-threshold', type=int)
+    parser.add_argument('--auto-compact-threshold', type=int)
+    parser.add_argument('--compact-preserve-messages', type=int)
+    parser.add_argument('--max-total-tokens', type=int)
+    parser.add_argument('--max-input-tokens', type=int)
+    parser.add_argument('--max-output-tokens', type=int)
+    parser.add_argument('--max-reasoning-tokens', type=int)
+    parser.add_argument('--max-budget-usd', type=float)
+    parser.add_argument('--max-tool-calls', type=int)
+    parser.add_argument('--max-delegated-tasks', type=int)
+    parser.add_argument('--response-schema-file')
+    parser.add_argument('--response-schema-name')
+    parser.add_argument('--response-schema-strict', action='store_true')
+    parser.add_argument('--scratchpad-root')
 
 
 def _build_resumed_agent(args: argparse.Namespace) -> tuple[LocalCodingAgent, StoredAgentSession]:
@@ -112,6 +196,23 @@ def _build_resumed_agent(args: argparse.Namespace) -> tuple[LocalCodingAgent, St
         model_config = replace(model_config, temperature=args.temperature)
     if args.timeout_seconds is not None:
         model_config = replace(model_config, timeout_seconds=args.timeout_seconds)
+    if args.input_cost_per_million is not None or args.output_cost_per_million is not None:
+        model_config = replace(
+            model_config,
+            pricing=replace(
+                model_config.pricing,
+                input_cost_per_million_tokens_usd=(
+                    args.input_cost_per_million
+                    if args.input_cost_per_million is not None
+                    else model_config.pricing.input_cost_per_million_tokens_usd
+                ),
+                output_cost_per_million_tokens_usd=(
+                    args.output_cost_per_million
+                    if args.output_cost_per_million is not None
+                    else model_config.pricing.output_cost_per_million_tokens_usd
+                ),
+            ),
+        )
 
     if args.max_turns is not None:
         runtime_config = replace(runtime_config, max_turns=args.max_turns)
@@ -124,6 +225,88 @@ def _build_resumed_agent(args: argparse.Namespace) -> tuple[LocalCodingAgent, St
                 allow_destructive_shell_commands=runtime_config.permissions.allow_destructive_shell_commands or args.unsafe,
             ),
         )
+    if args.stream:
+        runtime_config = replace(runtime_config, stream_model_responses=True)
+    if (
+        args.auto_snip_threshold is not None
+        or args.auto_compact_threshold is not None
+        or args.compact_preserve_messages is not None
+    ):
+        runtime_config = replace(
+            runtime_config,
+            auto_snip_threshold_tokens=(
+                args.auto_snip_threshold
+                if args.auto_snip_threshold is not None
+                else runtime_config.auto_snip_threshold_tokens
+            ),
+            auto_compact_threshold_tokens=(
+                args.auto_compact_threshold
+                if args.auto_compact_threshold is not None
+                else runtime_config.auto_compact_threshold_tokens
+            ),
+            compact_preserve_messages=(
+                max(0, args.compact_preserve_messages)
+                if args.compact_preserve_messages is not None
+                else runtime_config.compact_preserve_messages
+            ),
+        )
+    if (
+        args.max_total_tokens is not None
+        or args.max_input_tokens is not None
+        or args.max_output_tokens is not None
+        or args.max_reasoning_tokens is not None
+        or args.max_budget_usd is not None
+        or args.max_tool_calls is not None
+        or args.max_delegated_tasks is not None
+    ):
+        runtime_config = replace(
+            runtime_config,
+            budget_config=BudgetConfig(
+                max_total_tokens=(
+                    args.max_total_tokens
+                    if args.max_total_tokens is not None
+                    else runtime_config.budget_config.max_total_tokens
+                ),
+                max_input_tokens=(
+                    args.max_input_tokens
+                    if args.max_input_tokens is not None
+                    else runtime_config.budget_config.max_input_tokens
+                ),
+                max_output_tokens=(
+                    args.max_output_tokens
+                    if args.max_output_tokens is not None
+                    else runtime_config.budget_config.max_output_tokens
+                ),
+                max_reasoning_tokens=(
+                    args.max_reasoning_tokens
+                    if args.max_reasoning_tokens is not None
+                    else runtime_config.budget_config.max_reasoning_tokens
+                ),
+                max_total_cost_usd=(
+                    args.max_budget_usd
+                    if args.max_budget_usd is not None
+                    else runtime_config.budget_config.max_total_cost_usd
+                ),
+                max_tool_calls=(
+                    args.max_tool_calls
+                    if args.max_tool_calls is not None
+                    else runtime_config.budget_config.max_tool_calls
+                ),
+                max_delegated_tasks=(
+                    args.max_delegated_tasks
+                    if args.max_delegated_tasks is not None
+                    else runtime_config.budget_config.max_delegated_tasks
+                ),
+            ),
+        )
+    output_schema = _load_output_schema_config(args)
+    if output_schema is not None:
+        runtime_config = replace(runtime_config, output_schema=output_schema)
+    if args.scratchpad_root:
+        runtime_config = replace(
+            runtime_config,
+            scratchpad_root=Path(args.scratchpad_root).resolve(),
+        )
 
     agent = LocalCodingAgent(
         model_config=model_config,
@@ -134,11 +317,20 @@ def _build_resumed_agent(args: argparse.Namespace) -> tuple[LocalCodingAgent, St
 
 def _print_agent_result(result, *, show_transcript: bool) -> None:
     print(result.final_output)
+    print('\n# Usage')
+    print(f'total_tokens={result.usage.total_tokens}')
+    print(f'input_tokens={result.usage.input_tokens}')
+    print(f'output_tokens={result.usage.output_tokens}')
+    print(f'total_cost_usd={result.total_cost_usd:.6f}')
+    if result.stop_reason:
+        print(f'stop_reason={result.stop_reason}')
     if result.session_id:
         print('\n# Session')
         print(f'session_id={result.session_id}')
         if result.session_path:
             print(f'session_path={result.session_path}')
+    if result.scratchpad_directory:
+        print(f'scratchpad_directory={result.scratchpad_directory}')
     if show_transcript:
         print('\n# Transcript')
         for message in result.transcript:
