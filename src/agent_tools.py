@@ -2,15 +2,21 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import selectors
 import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterator, Union
+from typing import TYPE_CHECKING, Any, Callable, Iterator, Union
 
 from .agent_types import AgentPermissions, AgentRuntimeConfig, ToolExecutionResult
+
+if TYPE_CHECKING:
+    from .mcp_runtime import MCPRuntime
+    from .plan_runtime import PlanRuntime
+    from .task_runtime import TaskRuntime
 
 
 class ToolPermissionError(RuntimeError):
@@ -27,6 +33,10 @@ class ToolExecutionContext:
     command_timeout_seconds: float
     max_output_chars: int
     permissions: AgentPermissions
+    extra_env: dict[str, str] = field(default_factory=dict)
+    mcp_runtime: 'MCPRuntime | None' = None
+    plan_runtime: 'PlanRuntime | None' = None
+    task_runtime: 'TaskRuntime | None' = None
 
 
 ToolHandler = Callable[
@@ -60,8 +70,20 @@ class AgentTool:
             else:
                 content, metadata = result, {}
             return ToolExecutionResult(name=self.name, ok=True, content=content, metadata=metadata)
-        except (ToolPermissionError, ToolExecutionError, OSError, subprocess.SubprocessError) as exc:
-            return ToolExecutionResult(name=self.name, ok=False, content=str(exc))
+        except ToolPermissionError as exc:
+            return ToolExecutionResult(
+                name=self.name,
+                ok=False,
+                content=str(exc),
+                metadata={'error_kind': 'permission_denied'},
+            )
+        except (ToolExecutionError, OSError, subprocess.SubprocessError) as exc:
+            return ToolExecutionResult(
+                name=self.name,
+                ok=False,
+                content=str(exc),
+                metadata={'error_kind': 'tool_execution_error'},
+            )
 
 
 @dataclass(frozen=True)
@@ -73,12 +95,23 @@ class ToolStreamUpdate:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
-def build_tool_context(config: AgentRuntimeConfig) -> ToolExecutionContext:
+def build_tool_context(
+    config: AgentRuntimeConfig,
+    *,
+    extra_env: dict[str, str] | None = None,
+    mcp_runtime: 'MCPRuntime | None' = None,
+    plan_runtime: 'PlanRuntime | None' = None,
+    task_runtime: 'TaskRuntime | None' = None,
+) -> ToolExecutionContext:
     return ToolExecutionContext(
         root=config.cwd.resolve(),
         command_timeout_seconds=config.command_timeout_seconds,
         max_output_chars=config.max_output_chars,
         permissions=config.permissions,
+        extra_env=dict(extra_env or {}),
+        mcp_runtime=mcp_runtime,
+        plan_runtime=plan_runtime,
+        task_runtime=task_runtime,
     )
 
 
@@ -221,6 +254,159 @@ def default_tool_registry() -> dict[str, AgentTool]:
                 'required': ['command'],
             },
             handler=_run_bash,
+        ),
+        AgentTool(
+            name='mcp_list_resources',
+            description='List local MCP resources discovered from workspace MCP manifests.',
+            parameters={
+                'type': 'object',
+                'properties': {
+                    'query': {'type': 'string'},
+                    'max_resources': {'type': 'integer', 'minimum': 1, 'maximum': 200},
+                },
+            },
+            handler=_mcp_list_resources,
+        ),
+        AgentTool(
+            name='mcp_read_resource',
+            description='Read a local MCP resource by URI from workspace MCP manifests.',
+            parameters={
+                'type': 'object',
+                'properties': {
+                    'uri': {'type': 'string'},
+                    'max_chars': {'type': 'integer', 'minimum': 1, 'maximum': 50000},
+                },
+                'required': ['uri'],
+            },
+            handler=_mcp_read_resource,
+        ),
+        AgentTool(
+            name='plan_get',
+            description='Show the current local runtime plan.',
+            parameters={
+                'type': 'object',
+                'properties': {},
+            },
+            handler=_plan_get,
+        ),
+        AgentTool(
+            name='update_plan',
+            description='Replace the current local runtime plan with a structured multi-step plan and optionally sync it to tasks.',
+            parameters={
+                'type': 'object',
+                'properties': {
+                    'explanation': {'type': 'string'},
+                    'sync_tasks': {'type': 'boolean'},
+                    'items': {
+                        'type': 'array',
+                        'items': {
+                            'type': 'object',
+                            'properties': {
+                                'step': {'type': 'string'},
+                                'status': {'type': 'string'},
+                                'task_id': {'type': 'string'},
+                                'description': {'type': 'string'},
+                                'priority': {'type': 'string'},
+                            },
+                            'required': ['step'],
+                        },
+                    },
+                },
+                'required': ['items'],
+            },
+            handler=_update_plan,
+        ),
+        AgentTool(
+            name='plan_clear',
+            description='Clear the current local runtime plan and optionally sync the task runtime.',
+            parameters={
+                'type': 'object',
+                'properties': {
+                    'sync_tasks': {'type': 'boolean'},
+                },
+            },
+            handler=_plan_clear,
+        ),
+        AgentTool(
+            name='task_list',
+            description='List locally stored runtime tasks.',
+            parameters={
+                'type': 'object',
+                'properties': {
+                    'status': {'type': 'string'},
+                    'max_tasks': {'type': 'integer', 'minimum': 1, 'maximum': 200},
+                },
+            },
+            handler=_task_list,
+        ),
+        AgentTool(
+            name='task_get',
+            description='Show a locally stored runtime task by id.',
+            parameters={
+                'type': 'object',
+                'properties': {
+                    'task_id': {'type': 'string'},
+                },
+                'required': ['task_id'],
+            },
+            handler=_task_get,
+        ),
+        AgentTool(
+            name='task_create',
+            description='Create a locally stored runtime task.',
+            parameters={
+                'type': 'object',
+                'properties': {
+                    'title': {'type': 'string'},
+                    'description': {'type': 'string'},
+                    'status': {'type': 'string'},
+                    'priority': {'type': 'string'},
+                    'task_id': {'type': 'string'},
+                },
+                'required': ['title'],
+            },
+            handler=_task_create,
+        ),
+        AgentTool(
+            name='task_update',
+            description='Update a locally stored runtime task by id.',
+            parameters={
+                'type': 'object',
+                'properties': {
+                    'task_id': {'type': 'string'},
+                    'title': {'type': 'string'},
+                    'description': {'type': 'string'},
+                    'status': {'type': 'string'},
+                    'priority': {'type': 'string'},
+                },
+                'required': ['task_id'],
+            },
+            handler=_task_update,
+        ),
+        AgentTool(
+            name='todo_write',
+            description='Replace the current local runtime task list with a structured todo list.',
+            parameters={
+                'type': 'object',
+                'properties': {
+                    'items': {
+                        'type': 'array',
+                        'items': {
+                            'type': 'object',
+                            'properties': {
+                                'task_id': {'type': 'string'},
+                                'title': {'type': 'string'},
+                                'description': {'type': 'string'},
+                                'status': {'type': 'string'},
+                                'priority': {'type': 'string'},
+                            },
+                            'required': ['title'],
+                        },
+                    },
+                },
+                'required': ['items'],
+            },
+            handler=_todo_write,
         ),
         AgentTool(
             name='delegate_agent',
@@ -531,6 +717,7 @@ def _run_bash(arguments: dict[str, Any], context: ToolExecutionContext) -> str:
         capture_output=True,
         text=True,
         timeout=context.command_timeout_seconds,
+        env=_build_subprocess_env(context),
     )
     stdout = completed.stdout or ''
     stderr = completed.stderr or ''
@@ -554,6 +741,204 @@ def _run_bash(arguments: dict[str, Any], context: ToolExecutionContext) -> str:
     )
 
 
+def _mcp_list_resources(arguments: dict[str, Any], context: ToolExecutionContext) -> str:
+    runtime = _require_mcp_runtime(context)
+    query = arguments.get('query')
+    if query is not None and not isinstance(query, str):
+        raise ToolExecutionError('query must be a string')
+    max_resources = _coerce_int(arguments, 'max_resources', 50)
+    resources = runtime.list_resources(query=query, limit=max_resources)
+    if not resources:
+        return '(no MCP resources)'
+    lines: list[str] = []
+    for resource in resources:
+        details = [resource.uri, f'server={resource.server_name}']
+        if resource.name:
+            details.append(f'name={resource.name}')
+        if resource.mime_type:
+            details.append(f'mime={resource.mime_type}')
+        if resource.resolved_path:
+            details.append(f'path={resource.resolved_path}')
+        lines.append(' ; '.join(details))
+    return '\n'.join(lines)
+
+
+def _mcp_read_resource(arguments: dict[str, Any], context: ToolExecutionContext) -> str:
+    runtime = _require_mcp_runtime(context)
+    uri = _require_string(arguments, 'uri')
+    max_chars = _coerce_int(arguments, 'max_chars', context.max_output_chars)
+    try:
+        content = runtime.read_resource(uri, max_chars=max_chars)
+    except FileNotFoundError as exc:
+        raise ToolExecutionError(str(exc)) from exc
+    return content
+
+
+def _task_list(arguments: dict[str, Any], context: ToolExecutionContext) -> str:
+    runtime = _require_task_runtime(context)
+    status = arguments.get('status')
+    if status is not None and not isinstance(status, str):
+        raise ToolExecutionError('status must be a string')
+    max_tasks = _coerce_int(arguments, 'max_tasks', 50)
+    return runtime.render_tasks(status=status, limit=max_tasks)
+
+
+def _task_get(arguments: dict[str, Any], context: ToolExecutionContext) -> str:
+    runtime = _require_task_runtime(context)
+    return runtime.render_task(_require_string(arguments, 'task_id'))
+
+
+def _plan_get(arguments: dict[str, Any], context: ToolExecutionContext) -> str:
+    del arguments
+    runtime = _require_plan_runtime(context)
+    return runtime.render_plan()
+
+
+def _update_plan(arguments: dict[str, Any], context: ToolExecutionContext) -> str:
+    _ensure_write_allowed(context)
+    runtime = _require_plan_runtime(context)
+    items = arguments.get('items')
+    if not isinstance(items, list):
+        raise ToolExecutionError('items must be an array of plan step objects')
+    explanation = arguments.get('explanation')
+    if explanation is not None and not isinstance(explanation, str):
+        raise ToolExecutionError('explanation must be a string')
+    sync_tasks = arguments.get('sync_tasks', True)
+    if not isinstance(sync_tasks, bool):
+        raise ToolExecutionError('sync_tasks must be a boolean')
+    mutation = runtime.update_plan(
+        [item for item in items if isinstance(item, dict)],
+        explanation=explanation,
+        task_runtime=context.task_runtime,
+        sync_tasks=sync_tasks,
+    )
+    return (
+        f'updated plan with {mutation.after_count} step(s)',
+        _plan_mutation_metadata(
+            action='update_plan',
+            mutation=mutation,
+            total_steps=mutation.after_count,
+            sync_tasks=sync_tasks,
+        ),
+    )
+
+
+def _plan_clear(arguments: dict[str, Any], context: ToolExecutionContext) -> str:
+    _ensure_write_allowed(context)
+    runtime = _require_plan_runtime(context)
+    sync_tasks = arguments.get('sync_tasks', True)
+    if not isinstance(sync_tasks, bool):
+        raise ToolExecutionError('sync_tasks must be a boolean')
+    mutation = runtime.clear_plan(
+        task_runtime=context.task_runtime if sync_tasks else None,
+    )
+    return (
+        'cleared local plan',
+        _plan_mutation_metadata(
+            action='plan_clear',
+            mutation=mutation,
+            total_steps=0,
+            sync_tasks=sync_tasks,
+        ),
+    )
+
+
+def _task_create(arguments: dict[str, Any], context: ToolExecutionContext) -> str:
+    _ensure_write_allowed(context)
+    runtime = _require_task_runtime(context)
+    title = _require_string(arguments, 'title')
+    description = arguments.get('description')
+    status = arguments.get('status', 'todo')
+    priority = arguments.get('priority')
+    task_id = arguments.get('task_id')
+    if description is not None and not isinstance(description, str):
+        raise ToolExecutionError('description must be a string')
+    if status is not None and not isinstance(status, str):
+        raise ToolExecutionError('status must be a string')
+    if priority is not None and not isinstance(priority, str):
+        raise ToolExecutionError('priority must be a string')
+    if task_id is not None and not isinstance(task_id, str):
+        raise ToolExecutionError('task_id must be a string')
+    mutation = runtime.create_task(
+        title=title,
+        description=description,
+        status=status or 'todo',
+        priority=priority,
+        task_id=task_id,
+    )
+    task = mutation.task
+    assert task is not None
+    return (
+        f'created task {task.task_id}: {task.title} [{task.status}]',
+        _task_mutation_metadata(
+            action='task_create',
+            mutation=mutation,
+            task_id=task.task_id,
+            task_status=task.status,
+            total_tasks=mutation.after_count,
+        ),
+    )
+
+
+def _task_update(arguments: dict[str, Any], context: ToolExecutionContext) -> str:
+    _ensure_write_allowed(context)
+    runtime = _require_task_runtime(context)
+    task_id = _require_string(arguments, 'task_id')
+    title = arguments.get('title')
+    description = arguments.get('description')
+    status = arguments.get('status')
+    priority = arguments.get('priority')
+    for key, value in (
+        ('title', title),
+        ('description', description),
+        ('status', status),
+        ('priority', priority),
+    ):
+        if value is not None and not isinstance(value, str):
+            raise ToolExecutionError(f'{key} must be a string')
+    try:
+        mutation = runtime.update_task(
+            task_id,
+            title=title,
+            description=description,
+            status=status,
+            priority=priority,
+        )
+    except KeyError as exc:
+        raise ToolExecutionError(f'Unknown task id: {task_id}') from exc
+    task = mutation.task
+    assert task is not None
+    return (
+        f'updated task {task.task_id}: {task.title} [{task.status}]',
+        _task_mutation_metadata(
+            action='task_update',
+            mutation=mutation,
+            task_id=task.task_id,
+            task_status=task.status,
+            total_tasks=mutation.after_count,
+        ),
+    )
+
+
+def _todo_write(arguments: dict[str, Any], context: ToolExecutionContext) -> str:
+    _ensure_write_allowed(context)
+    runtime = _require_task_runtime(context)
+    items = arguments.get('items')
+    if not isinstance(items, list):
+        raise ToolExecutionError('items must be an array of task objects')
+    mutation = runtime.replace_tasks(
+        [item for item in items if isinstance(item, dict)]
+    )
+    return (
+        f'replaced todo list with {mutation.after_count} task(s)',
+        _task_mutation_metadata(
+            action='todo_write',
+            mutation=mutation,
+            total_tasks=mutation.after_count,
+        ),
+    )
+
+
 def _stream_bash(
     arguments: dict[str, Any],
     context: ToolExecutionContext,
@@ -570,6 +955,7 @@ def _stream_bash(
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
+            env=_build_subprocess_env(context),
         )
     except (ToolPermissionError, ToolExecutionError, OSError, subprocess.SubprocessError) as exc:
         yield ToolStreamUpdate(
@@ -687,6 +1073,95 @@ def _delegate_agent_placeholder(
     )
 
 
+def _require_mcp_runtime(context: ToolExecutionContext):
+    if context.mcp_runtime is None or not context.mcp_runtime.resources:
+        raise ToolExecutionError(
+            'No local MCP resources are available. Add a .claw-mcp.json or .mcp.json manifest first.'
+        )
+    return context.mcp_runtime
+
+
+def _require_plan_runtime(context: ToolExecutionContext):
+    if context.plan_runtime is None:
+        raise ToolExecutionError('Local plan runtime is not available.')
+    return context.plan_runtime
+
+
+def _require_task_runtime(context: ToolExecutionContext):
+    if context.task_runtime is None:
+        raise ToolExecutionError('Local task runtime is not available.')
+    return context.task_runtime
+
+
+def _task_mutation_metadata(
+    *,
+    action: str,
+    mutation,
+    task_id: str | None = None,
+    task_status: str | None = None,
+    total_tasks: int,
+) -> dict[str, Any]:
+    try:
+        relative_path = str(Path(mutation.store_path).relative_to(Path.cwd()))
+    except ValueError:
+        relative_path = str(mutation.store_path)
+    payload: dict[str, Any] = {
+        'action': action,
+        'path': relative_path,
+        'before_sha256': mutation.before_sha256,
+        'after_sha256': mutation.after_sha256,
+        'before_preview': mutation.before_preview,
+        'after_preview': mutation.after_preview,
+        'before_task_count': mutation.before_count,
+        'after_task_count': mutation.after_count,
+        'total_tasks': total_tasks,
+    }
+    if task_id is not None:
+        payload['task_id'] = task_id
+    if task_status is not None:
+        payload['task_status'] = task_status
+    return payload
+
+
+def _plan_mutation_metadata(
+    *,
+    action: str,
+    mutation,
+    total_steps: int,
+    sync_tasks: bool,
+) -> dict[str, Any]:
+    try:
+        relative_path = str(Path(mutation.store_path).relative_to(Path.cwd()))
+    except ValueError:
+        relative_path = str(mutation.store_path)
+    payload: dict[str, Any] = {
+        'action': action,
+        'path': relative_path,
+        'before_sha256': mutation.before_sha256,
+        'after_sha256': mutation.after_sha256,
+        'before_preview': mutation.before_preview,
+        'after_preview': mutation.after_preview,
+        'before_plan_count': mutation.before_count,
+        'after_plan_count': mutation.after_count,
+        'total_steps': total_steps,
+        'sync_tasks': sync_tasks,
+    }
+    if mutation.explanation is not None:
+        payload['explanation'] = mutation.explanation
+    if mutation.synced_task_store_path is not None:
+        try:
+            payload['synced_task_store_path'] = str(
+                Path(mutation.synced_task_store_path).relative_to(Path.cwd())
+            )
+        except ValueError:
+            payload['synced_task_store_path'] = mutation.synced_task_store_path
+    if mutation.synced_task_sha256 is not None:
+        payload['synced_task_sha256'] = mutation.synced_task_sha256
+    if mutation.synced_tasks:
+        payload['synced_tasks'] = mutation.synced_tasks
+    return payload
+
+
 def _drain_registered_streams(
     selector: selectors.BaseSelector,
     stdout_chunks: list[str],
@@ -719,6 +1194,12 @@ def _drain_registered_streams(
             key.fileobj.close()
         except Exception:
             pass
+
+
+def _build_subprocess_env(context: ToolExecutionContext) -> dict[str, str]:
+    env = os.environ.copy()
+    env.update(context.extra_env)
+    return env
 
 
 def _stream_static_text_result(

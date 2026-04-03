@@ -77,16 +77,16 @@ def preprocess_slash_command(
             'Commands are in the form `/command [args]`.',
         )
 
-    if parsed.is_mcp:
-        return _local_result(
-            input_text,
-            'MCP slash commands are not implemented in the Python runtime yet.',
-        )
-
-    spec = find_slash_command(parsed.command_name)
+    normalized_name = (
+        parsed.command_name[:-6]
+        if parsed.is_mcp and parsed.command_name.endswith(' (MCP)')
+        else parsed.command_name
+    )
+    spec = find_slash_command(normalized_name)
     if spec is None:
         if looks_like_command(parsed.command_name):
-            return _local_result(input_text, f'Unknown skill: {parsed.command_name}')
+            label = normalized_name if parsed.is_mcp else parsed.command_name
+            return _local_result(input_text, f'Unknown skill: {label}')
         return SlashCommandResult(handled=False, should_query=True, prompt=input_text)
 
     return spec.handler(agent, parsed.args.strip(), input_text)
@@ -110,6 +110,36 @@ def get_slash_command_specs() -> tuple[SlashCommandSpec, ...]:
             handler=_handle_context_raw,
         ),
         SlashCommandSpec(
+            names=('mcp',),
+            description='Show discovered local MCP manifests and resource counts.',
+            handler=_handle_mcp,
+        ),
+        SlashCommandSpec(
+            names=('resources',),
+            description='List local MCP resources, optionally filtered by a query string.',
+            handler=_handle_resources,
+        ),
+        SlashCommandSpec(
+            names=('resource',),
+            description='Render a local MCP resource by URI.',
+            handler=_handle_resource,
+        ),
+        SlashCommandSpec(
+            names=('tasks', 'todo'),
+            description='Show the local runtime task list, optionally filtered by status.',
+            handler=_handle_tasks,
+        ),
+        SlashCommandSpec(
+            names=('plan', 'planner'),
+            description='Show the current local runtime plan.',
+            handler=_handle_plan,
+        ),
+        SlashCommandSpec(
+            names=('task',),
+            description='Show a local runtime task by id.',
+            handler=_handle_task,
+        ),
+        SlashCommandSpec(
             names=('prompt', 'system-prompt'),
             description='Render the effective Python system prompt.',
             handler=_handle_prompt,
@@ -118,6 +148,16 @@ def get_slash_command_specs() -> tuple[SlashCommandSpec, ...]:
             names=('permissions',),
             description='Show the active tool permission mode.',
             handler=_handle_permissions,
+        ),
+        SlashCommandSpec(
+            names=('hooks', 'policy'),
+            description='Show discovered local hook and policy manifests.',
+            handler=_handle_hooks,
+        ),
+        SlashCommandSpec(
+            names=('trust',),
+            description='Show workspace trust mode, managed settings, and safe environment values.',
+            handler=_handle_trust,
         ),
         SlashCommandSpec(
             names=('model',),
@@ -180,12 +220,51 @@ def _handle_context_raw(agent: 'LocalCodingAgent', _args: str, input_text: str) 
     return _local_result(input_text, agent.render_context_snapshot_report())
 
 
+def _handle_mcp(agent: 'LocalCodingAgent', args: str, input_text: str) -> SlashCommandResult:
+    query = args or None
+    return _local_result(input_text, agent.render_mcp_report(query))
+
+
+def _handle_resources(agent: 'LocalCodingAgent', args: str, input_text: str) -> SlashCommandResult:
+    query = args or None
+    return _local_result(input_text, agent.render_mcp_resources_report(query))
+
+
+def _handle_resource(agent: 'LocalCodingAgent', args: str, input_text: str) -> SlashCommandResult:
+    if not args:
+        return _local_result(input_text, 'Usage: /resource <mcp-resource-uri>')
+    return _local_result(input_text, agent.render_mcp_resource_report(args))
+
+
+def _handle_tasks(agent: 'LocalCodingAgent', args: str, input_text: str) -> SlashCommandResult:
+    status = args or None
+    return _local_result(input_text, agent.render_tasks_report(status))
+
+
+def _handle_plan(agent: 'LocalCodingAgent', _args: str, input_text: str) -> SlashCommandResult:
+    return _local_result(input_text, agent.render_plan_report())
+
+
+def _handle_task(agent: 'LocalCodingAgent', args: str, input_text: str) -> SlashCommandResult:
+    if not args:
+        return _local_result(input_text, 'Usage: /task <task-id>')
+    return _local_result(input_text, agent.render_task_report(args))
+
+
 def _handle_prompt(agent: 'LocalCodingAgent', _args: str, input_text: str) -> SlashCommandResult:
     return _local_result(input_text, agent.render_system_prompt())
 
 
 def _handle_permissions(agent: 'LocalCodingAgent', _args: str, input_text: str) -> SlashCommandResult:
     return _local_result(input_text, agent.render_permissions_report())
+
+
+def _handle_hooks(agent: 'LocalCodingAgent', _args: str, input_text: str) -> SlashCommandResult:
+    return _local_result(input_text, agent.render_hook_policy_report())
+
+
+def _handle_trust(agent: 'LocalCodingAgent', _args: str, input_text: str) -> SlashCommandResult:
+    return _local_result(input_text, agent.render_trust_report())
 
 
 def _handle_model(agent: 'LocalCodingAgent', args: str, input_text: str) -> SlashCommandResult:

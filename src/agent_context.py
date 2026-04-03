@@ -9,7 +9,11 @@ from functools import lru_cache
 from pathlib import Path
 
 from .agent_plugin_cache import load_plugin_cache_summary
+from .hook_policy import HookPolicyRuntime
+from .mcp_runtime import MCPRuntime
+from .plan_runtime import PlanRuntime
 from .plugin_runtime import PluginRuntime
+from .task_runtime import TaskRuntime
 from .agent_types import AgentRuntimeConfig
 
 MAX_STATUS_CHARS = 2000
@@ -197,6 +201,35 @@ def _get_user_context_cached(
     plugin_runtime = PluginRuntime.from_workspace(Path(cwd), additional_working_directories)
     if plugin_runtime.manifests:
         context['pluginRuntime'] = plugin_runtime.render_summary()
+    hook_policy_runtime = HookPolicyRuntime.from_workspace(Path(cwd), additional_working_directories)
+    if hook_policy_runtime.manifests:
+        context['hookPolicy'] = hook_policy_runtime.render_summary()
+        managed_settings = hook_policy_runtime.managed_settings()
+        if managed_settings:
+            context['managedSettings'] = '\n'.join(
+                f'{key}={value}'
+                for key, value in sorted(managed_settings.items())
+            )
+        safe_env = hook_policy_runtime.safe_env()
+        if safe_env:
+            context['safeEnv'] = '\n'.join(
+                f'{key}={value}'
+                for key, value in sorted(safe_env.items())
+            )
+        context['trustMode'] = (
+            'Workspace trust mode: trusted'
+            if hook_policy_runtime.is_trusted()
+            else 'Workspace trust mode: untrusted'
+        )
+    mcp_runtime = MCPRuntime.from_workspace(Path(cwd), additional_working_directories)
+    if mcp_runtime.resources:
+        context['mcpRuntime'] = mcp_runtime.render_summary()
+    plan_runtime = PlanRuntime.from_workspace(Path(cwd))
+    if plan_runtime.steps:
+        context['planRuntime'] = plan_runtime.render_summary()
+    task_runtime = TaskRuntime.from_workspace(Path(cwd))
+    if task_runtime.tasks:
+        context['taskRuntime'] = task_runtime.render_summary()
     return context
 
 

@@ -10,6 +10,8 @@ from uuid import uuid4
 from .agent_manager import AgentManager
 from .agent_context import render_context_report as render_agent_context_report
 from .agent_context_usage import collect_context_usage, estimate_tokens, format_context_usage
+from .hook_policy import HookPolicyRuntime
+from .mcp_runtime import MCPRuntime
 from .agent_prompting import (
     build_prompt_context,
     build_system_prompt_parts,
@@ -38,7 +40,9 @@ from .agent_types import (
     UsageStats,
 )
 from .openai_compat import OpenAICompatClient, OpenAICompatError
+from .plan_runtime import PlanRuntime
 from .plugin_runtime import PluginRuntime
+from .task_runtime import TaskRuntime
 from .session_store import (
     StoredAgentSession,
     load_agent_session,
@@ -69,6 +73,10 @@ class LocalCodingAgent:
     managed_child_index: int | None = None
     managed_label: str | None = None
     plugin_runtime: PluginRuntime | None = None
+    hook_policy_runtime: HookPolicyRuntime | None = None
+    mcp_runtime: MCPRuntime | None = None
+    plan_runtime: PlanRuntime | None = None
+    task_runtime: TaskRuntime | None = None
     last_session: AgentSessionState | None = field(default=None, init=False, repr=False)
     last_run_result: AgentRunResult | None = field(default=None, init=False, repr=False)
     active_session_id: str | None = field(default=None, init=False, repr=False)
@@ -86,6 +94,21 @@ class LocalCodingAgent:
                 self.runtime_config.cwd,
                 tuple(str(path) for path in self.runtime_config.additional_working_directories),
             )
+        if self.hook_policy_runtime is None:
+            self.hook_policy_runtime = HookPolicyRuntime.from_workspace(
+                self.runtime_config.cwd,
+                tuple(str(path) for path in self.runtime_config.additional_working_directories),
+            )
+        if self.mcp_runtime is None:
+            self.mcp_runtime = MCPRuntime.from_workspace(
+                self.runtime_config.cwd,
+                tuple(str(path) for path in self.runtime_config.additional_working_directories),
+            )
+        if self.plan_runtime is None:
+            self.plan_runtime = PlanRuntime.from_workspace(self.runtime_config.cwd)
+        if self.task_runtime is None:
+            self.task_runtime = TaskRuntime.from_workspace(self.runtime_config.cwd)
+        self.runtime_config = self._apply_hook_policy_budget_overrides(self.runtime_config)
         registry = dict(self.tool_registry)
         plugin_tools = self.plugin_runtime.register_tool_aliases(registry)
         if plugin_tools:
@@ -95,7 +118,17 @@ class LocalCodingAgent:
             registry = {**registry, **virtual_tools}
         self.tool_registry = registry
         self.client = OpenAICompatClient(self.model_config)
-        self.tool_context = build_tool_context(self.runtime_config)
+        self.tool_context = build_tool_context(
+            self.runtime_config,
+            extra_env=(
+                self.hook_policy_runtime.safe_env()
+                if self.hook_policy_runtime is not None
+                else None
+            ),
+            mcp_runtime=self.mcp_runtime,
+            plan_runtime=self.plan_runtime,
+            task_runtime=self.task_runtime,
+        )
 
     def set_model(self, model: str) -> None:
         self.model_config = replace(self.model_config, model=model)
@@ -142,6 +175,67 @@ class LocalCodingAgent:
             user_prompt,
             user_context=prompt_context.user_context,
             system_context=prompt_context.system_context,
+        )
+
+    def _apply_hook_policy_budget_overrides(
+        self,
+        runtime_config: AgentRuntimeConfig,
+    ) -> AgentRuntimeConfig:
+        if self.hook_policy_runtime is None or not self.hook_policy_runtime.manifests:
+            return runtime_config
+        overrides = self.hook_policy_runtime.budget_overrides()
+        if not overrides:
+            return runtime_config
+        budget = runtime_config.budget_config
+        return replace(
+            runtime_config,
+            budget_config=BudgetConfig(
+                max_total_tokens=(
+                    budget.max_total_tokens
+                    if budget.max_total_tokens is not None
+                    else _optional_policy_int(overrides.get('max_total_tokens'))
+                ),
+                max_input_tokens=(
+                    budget.max_input_tokens
+                    if budget.max_input_tokens is not None
+                    else _optional_policy_int(overrides.get('max_input_tokens'))
+                ),
+                max_output_tokens=(
+                    budget.max_output_tokens
+                    if budget.max_output_tokens is not None
+                    else _optional_policy_int(overrides.get('max_output_tokens'))
+                ),
+                max_reasoning_tokens=(
+                    budget.max_reasoning_tokens
+                    if budget.max_reasoning_tokens is not None
+                    else _optional_policy_int(overrides.get('max_reasoning_tokens'))
+                ),
+                max_total_cost_usd=(
+                    budget.max_total_cost_usd
+                    if budget.max_total_cost_usd is not None
+                    else _optional_policy_float(overrides.get('max_total_cost_usd'))
+                ),
+                max_tool_calls=(
+                    budget.max_tool_calls
+                    if budget.max_tool_calls is not None
+                    else _optional_policy_int(overrides.get('max_tool_calls'))
+                ),
+                max_delegated_tasks=(
+                    budget.max_delegated_tasks
+                    if budget.max_delegated_tasks is not None
+                    else _optional_policy_int(overrides.get('max_delegated_tasks'))
+                ),
+                max_model_calls=(
+                    budget.max_model_calls
+                    if budget.max_model_calls is not None
+                    else _optional_policy_int(overrides.get('max_model_calls'))
+                ),
+                max_session_turns=(
+                    budget.max_session_turns
+                    if budget.max_session_turns is not None
+                    else _optional_policy_int(overrides.get('max_session_turns'))
+                ),
+            ),
         )
 
     def run(self, prompt: str) -> AgentRunResult:
@@ -220,7 +314,10 @@ class LocalCodingAgent:
                 ),
             )
 
-        effective_prompt = self._apply_plugin_before_prompt_hooks(slash_result.prompt or prompt)
+        effective_prompt = self._apply_hook_policy_before_prompt_hooks(
+            slash_result.prompt or prompt
+        )
+        effective_prompt = self._apply_plugin_before_prompt_hooks(effective_prompt)
         effective_prompt = self._apply_plugin_resume_hooks(
             effective_prompt,
             resumed=base_session is not None,
@@ -431,7 +528,7 @@ class LocalCodingAgent:
                         str(scratchpad_directory) if scratchpad_directory is not None else None
                     ),
                 )
-                result = self._append_plugin_after_turn_events(
+                result = self._append_runtime_after_turn_events(
                     result,
                     prompt=effective_prompt,
                     turn_index=turn_index,
@@ -512,7 +609,7 @@ class LocalCodingAgent:
                         str(scratchpad_directory) if scratchpad_directory is not None else None
                     ),
                 )
-                result = self._append_plugin_after_turn_events(
+                result = self._append_runtime_after_turn_events(
                     result,
                     prompt=effective_prompt,
                     turn_index=turn_index,
@@ -583,6 +680,9 @@ class LocalCodingAgent:
                 if self.plugin_runtime is not None:
                     self.plugin_runtime.record_tool_attempt(tool_call.name, blocked=False)
                 plugin_preflight_messages = self._plugin_tool_preflight_messages(tool_call.name)
+                policy_preflight_messages = self._hook_policy_tool_preflight_messages(
+                    tool_call.name
+                )
                 if plugin_preflight_messages:
                     stream_events.append(
                         {
@@ -593,7 +693,18 @@ class LocalCodingAgent:
                             'message_count': len(plugin_preflight_messages),
                         }
                     )
+                if policy_preflight_messages:
+                    stream_events.append(
+                        {
+                            'type': 'hook_policy_tool_preflight',
+                            'tool_name': tool_call.name,
+                            'tool_call_id': tool_call.id,
+                            'message_id': session.messages[tool_message_index].message_id,
+                            'message_count': len(policy_preflight_messages),
+                        }
+                    )
                 plugin_block_message = self._plugin_block_message(tool_call.name)
+                policy_block_message = self._hook_policy_block_message(tool_call.name)
                 if plugin_block_message is not None:
                     if self.plugin_runtime is not None:
                         blocked_attempts = int(
@@ -619,6 +730,27 @@ class LocalCodingAgent:
                             'tool_call_id': tool_call.id,
                             'message_id': session.messages[tool_message_index].message_id,
                             'message': plugin_block_message,
+                        }
+                    )
+                if policy_block_message is not None:
+                    tool_result = ToolExecutionResult(
+                        name=tool_call.name,
+                        ok=False,
+                        content=policy_block_message,
+                        metadata={
+                            'action': 'hook_policy_block',
+                            'hook_policy_blocked': True,
+                            'hook_policy_block_message': policy_block_message,
+                            'error_kind': 'permission_denied',
+                        },
+                    )
+                    stream_events.append(
+                        {
+                            'type': 'hook_policy_tool_block',
+                            'tool_name': tool_call.name,
+                            'tool_call_id': tool_call.id,
+                            'message_id': session.messages[tool_message_index].message_id,
+                            'message': policy_block_message,
                         }
                     )
                 if tool_call.name == 'delegate_agent':
@@ -658,6 +790,7 @@ class LocalCodingAgent:
                         metadata=tool_result.metadata,
                     )
                 plugin_messages = self._plugin_tool_result_messages(tool_call.name)
+                policy_messages = self._hook_policy_tool_result_messages(tool_call.name)
                 if plugin_messages:
                     merged_metadata = dict(tool_result.metadata)
                     merged_metadata['plugin_messages'] = list(plugin_messages)
@@ -677,12 +810,47 @@ class LocalCodingAgent:
                                 'message': message,
                             }
                         )
+                if policy_messages:
+                    merged_metadata = dict(tool_result.metadata)
+                    merged_metadata['hook_policy_messages'] = list(policy_messages)
+                    tool_result = ToolExecutionResult(
+                        name=tool_result.name,
+                        ok=tool_result.ok,
+                        content=tool_result.content,
+                        metadata=merged_metadata,
+                    )
+                    for message in policy_messages:
+                        stream_events.append(
+                            {
+                                'type': 'hook_policy_tool_hook',
+                                'tool_name': tool_call.name,
+                                'tool_call_id': tool_call.id,
+                                'message_id': session.messages[tool_message_index].message_id,
+                                'message': message,
+                            }
+                        )
+                if tool_result.metadata.get('error_kind') == 'permission_denied':
+                    stream_events.append(
+                        {
+                            'type': 'tool_permission_denial',
+                            'tool_name': tool_call.name,
+                            'tool_call_id': tool_call.id,
+                            'message_id': session.messages[tool_message_index].message_id,
+                            'reason': tool_result.content,
+                            'source': (
+                                'hook_policy'
+                                if tool_result.metadata.get('action') == 'hook_policy_block'
+                                else 'tool_runtime'
+                            ),
+                        }
+                    )
                 session.finalize_tool(
                     tool_message_index,
                     content=serialize_tool_result(tool_result),
                     metadata={
                         'phase': 'completed',
                         'plugin_preflight_messages': list(plugin_preflight_messages),
+                        'hook_policy_preflight_messages': list(policy_preflight_messages),
                         **dict(tool_result.metadata),
                     },
                     stop_reason='tool_completed',
@@ -707,6 +875,9 @@ class LocalCodingAgent:
                     preflight_messages=plugin_preflight_messages,
                     block_message=plugin_block_message,
                     plugin_messages=plugin_messages,
+                    hook_policy_preflight_messages=policy_preflight_messages,
+                    hook_policy_block_message=policy_block_message,
+                    hook_policy_messages=policy_messages,
                     delegate_preflight_messages=tuple(
                         message
                         for message in tool_result.metadata.get(
@@ -774,7 +945,7 @@ class LocalCodingAgent:
                 str(scratchpad_directory) if scratchpad_directory is not None else None
             ),
         )
-        result = self._append_plugin_after_turn_events(
+        result = self._append_runtime_after_turn_events(
             result,
             prompt=effective_prompt,
             turn_index=self.runtime_config.max_turns,
@@ -2381,6 +2552,39 @@ class LocalCodingAgent:
         )
         return '\n'.join(lines)
 
+    def _apply_hook_policy_before_prompt_hooks(self, prompt: str) -> str:
+        if self.hook_policy_runtime is None or not self.hook_policy_runtime.manifests:
+            return prompt
+        injections = self.hook_policy_runtime.before_prompt_messages()
+        managed_settings = self.hook_policy_runtime.managed_settings()
+        safe_env = self.hook_policy_runtime.safe_env()
+        trusted = self.hook_policy_runtime.is_trusted()
+        if not injections and not managed_settings and not safe_env and trusted:
+            return prompt
+        lines = ['<system-reminder>', 'Workspace hook/policy guidance:']
+        lines.append(
+            f'- Trust mode: {"trusted" if trusted else "untrusted"}'
+        )
+        if not trusted:
+            lines.append(
+                '- Untrusted workspaces should favor inspection-first behavior. '
+                'Avoid unnecessary writes or shell actions unless the task clearly requires them.'
+            )
+        for entry in injections:
+            lines.append(f'- Before prompt: {entry}')
+        if managed_settings:
+            lines.append(
+                '- Managed settings: '
+                + ', '.join(f'{key}={value}' for key, value in sorted(managed_settings.items()))
+            )
+        if safe_env:
+            lines.append(
+                '- Safe environment values loaded for tools: '
+                + ', '.join(sorted(safe_env))
+            )
+        lines.extend(['</system-reminder>', '', prompt])
+        return '\n'.join(lines)
+
     def _build_plugin_tool_runtime_message(
         self,
         *,
@@ -2388,6 +2592,9 @@ class LocalCodingAgent:
         preflight_messages: tuple[str, ...],
         block_message: str | None,
         plugin_messages: tuple[str, ...],
+        hook_policy_preflight_messages: tuple[str, ...] = (),
+        hook_policy_block_message: str | None = None,
+        hook_policy_messages: tuple[str, ...] = (),
         delegate_preflight_messages: tuple[str, ...] = (),
         delegate_after_messages: tuple[str, ...] = (),
     ) -> str | None:
@@ -2395,28 +2602,46 @@ class LocalCodingAgent:
             block_message is None
             and not plugin_messages
             and not preflight_messages
+            and hook_policy_block_message is None
+            and not hook_policy_preflight_messages
+            and not hook_policy_messages
             and not delegate_preflight_messages
             and not delegate_after_messages
         ):
             return None
+        plugin_only = (
+            hook_policy_block_message is None
+            and not hook_policy_preflight_messages
+            and not hook_policy_messages
+        )
         lines = [
             '<system-reminder>',
-            f'Plugin tool runtime guidance for `{tool_name}`:',
+            (
+                f'Plugin tool runtime guidance for `{tool_name}`:'
+                if plugin_only
+                else f'Runtime tool guidance for `{tool_name}`:'
+            ),
         ]
         for message in preflight_messages:
             lines.append(f'- Before tool: {message}')
+        for message in hook_policy_preflight_messages:
+            lines.append(f'- Hook/policy before tool: {message}')
         for message in delegate_preflight_messages:
             lines.append(f'- Before delegate: {message}')
         if block_message is not None:
             lines.append(f'- Blocked: {block_message}')
+        if hook_policy_block_message is not None:
+            lines.append(f'- Hook/policy blocked: {hook_policy_block_message}')
         for message in plugin_messages:
             lines.append(f'- After result: {message}')
+        for message in hook_policy_messages:
+            lines.append(f'- Hook/policy after result: {message}')
         for message in delegate_after_messages:
             lines.append(f'- After delegate: {message}')
         lines.extend(
             [
                 '',
-                'Use this plugin guidance when deciding the next tool call or assistant response.',
+                'Use this runtime guidance when deciding the next tool call or assistant response.',
                 '</system-reminder>',
             ]
         )
@@ -2436,6 +2661,21 @@ class LocalCodingAgent:
         if self.plugin_runtime is None:
             return ()
         return self.plugin_runtime.tool_result_injections(tool_name)
+
+    def _hook_policy_tool_preflight_messages(self, tool_name: str) -> tuple[str, ...]:
+        if self.hook_policy_runtime is None:
+            return ()
+        return self.hook_policy_runtime.before_tool_messages(tool_name)
+
+    def _hook_policy_block_message(self, tool_name: str) -> str | None:
+        if self.hook_policy_runtime is None:
+            return None
+        return self.hook_policy_runtime.denied_tool_message(tool_name)
+
+    def _hook_policy_tool_result_messages(self, tool_name: str) -> tuple[str, ...]:
+        if self.hook_policy_runtime is None:
+            return ()
+        return self.hook_policy_runtime.after_tool_messages(tool_name)
 
     def _persist_session(
         self,
@@ -2546,15 +2786,27 @@ class LocalCodingAgent:
 
     def render_permissions_report(self) -> str:
         permissions = self.runtime_config.permissions
-        return '\n'.join(
-            [
-                '# Permissions',
-                '',
-                f'- File write tools: {"enabled" if permissions.allow_file_write else "disabled"}',
-                f'- Shell commands: {"enabled" if permissions.allow_shell_commands else "disabled"}',
-                f'- Destructive shell commands: {"enabled" if permissions.allow_destructive_shell_commands else "disabled"}',
-            ]
-        )
+        lines = [
+            '# Permissions',
+            '',
+            f'- File write tools: {"enabled" if permissions.allow_file_write else "disabled"}',
+            f'- Shell commands: {"enabled" if permissions.allow_shell_commands else "disabled"}',
+            f'- Destructive shell commands: {"enabled" if permissions.allow_destructive_shell_commands else "disabled"}',
+        ]
+        if self.hook_policy_runtime is not None and self.hook_policy_runtime.manifests:
+            lines.append(
+                f'- Workspace trust mode: {"trusted" if self.hook_policy_runtime.is_trusted() else "untrusted"}'
+            )
+            denied_tools = sorted(
+                {
+                    name
+                    for manifest in self.hook_policy_runtime.manifests
+                    for name in manifest.deny_tools
+                }
+            )
+            if denied_tools:
+                lines.append('- Policy-denied tools: ' + ', '.join(denied_tools))
+        return '\n'.join(lines)
 
     def render_tools_report(self) -> str:
         permissions = self.runtime_config.permissions
@@ -2565,6 +2817,11 @@ class LocalCodingAgent:
                 state = 'blocked by permissions'
             if tool.name in {'write_file', 'edit_file'} and not permissions.allow_file_write:
                 state = 'blocked by permissions'
+            if (
+                self.hook_policy_runtime is not None
+                and self.hook_policy_runtime.denied_tool_message(tool.name) is not None
+            ):
+                state = 'blocked by hook policy'
             lines.append(f'- `{tool.name}`: {tool.description} [{state}]')
         return '\n'.join(lines)
 
@@ -2574,6 +2831,64 @@ class LocalCodingAgent:
         if not claude_md:
             return '# Memory\n\nNo CLAUDE.md memory files are currently loaded.'
         return '\n'.join(['# Memory', '', claude_md])
+
+    def render_mcp_report(self, query: str | None = None) -> str:
+        if self.mcp_runtime is None:
+            return '# MCP\n\nNo local MCP manifests or resources discovered.'
+        if query:
+            return self.mcp_runtime.render_resource_index(query=query)
+        return '\n'.join(['# MCP', '', self.mcp_runtime.render_summary()])
+
+    def render_mcp_resources_report(self, query: str | None = None) -> str:
+        if self.mcp_runtime is None:
+            return '# MCP Resources\n\nNo local MCP manifests or resources discovered.'
+        return self.mcp_runtime.render_resource_index(query=query)
+
+    def render_mcp_resource_report(self, uri: str) -> str:
+        if self.mcp_runtime is None:
+            return '# MCP Resource\n\nNo local MCP manifests or resources discovered.'
+        return self.mcp_runtime.render_resource(uri)
+
+    def render_tasks_report(self, status: str | None = None) -> str:
+        if self.task_runtime is None:
+            return '# Tasks\n\nNo local task runtime is available.'
+        return self.task_runtime.render_tasks(status=status)
+
+    def render_plan_report(self) -> str:
+        if self.plan_runtime is None:
+            return '# Plan\n\nNo local plan runtime is available.'
+        return self.plan_runtime.render_plan()
+
+    def render_task_report(self, task_id: str) -> str:
+        if self.task_runtime is None:
+            return '# Task\n\nNo local task runtime is available.'
+        return self.task_runtime.render_task(task_id)
+
+    def render_hook_policy_report(self) -> str:
+        if self.hook_policy_runtime is None:
+            return '# Hook Policy\n\nNo local hook or policy manifests discovered.'
+        return '\n'.join(['# Hook Policy', '', self.hook_policy_runtime.render_summary()])
+
+    def render_trust_report(self) -> str:
+        trusted = True
+        settings: dict[str, Any] = {}
+        env_values: dict[str, str] = {}
+        if self.hook_policy_runtime is not None:
+            trusted = self.hook_policy_runtime.is_trusted()
+            settings = self.hook_policy_runtime.managed_settings()
+            env_values = self.hook_policy_runtime.safe_env()
+        lines = [
+            '# Trust',
+            '',
+            f'- Workspace trust mode: {"trusted" if trusted else "untrusted"}',
+        ]
+        if settings:
+            lines.append('- Managed settings:')
+            lines.extend(f'  - {key}={value}' for key, value in sorted(settings.items()))
+        if env_values:
+            lines.append('- Safe environment values:')
+            lines.extend(f'  - {key}={value}' for key, value in sorted(env_values.items()))
+        return '\n'.join(lines)
 
     def render_status_report(self) -> str:
         lines = [
@@ -2585,6 +2900,16 @@ class LocalCodingAgent:
             f'- Session ID: {self.active_session_id or "none"}',
             f'- Last session loaded: {"yes" if self.last_session is not None else "no"}',
         ]
+        if self.hook_policy_runtime is not None and self.hook_policy_runtime.manifests:
+            lines.append(
+                f'- Workspace trust mode: {"trusted" if self.hook_policy_runtime.is_trusted() else "untrusted"}'
+            )
+        if self.mcp_runtime is not None and self.mcp_runtime.resources:
+            lines.append(f'- MCP resources: {len(self.mcp_runtime.resources)}')
+        if self.plan_runtime is not None and self.plan_runtime.steps:
+            lines.append(f'- Local plan steps: {len(self.plan_runtime.steps)}')
+        if self.task_runtime is not None and self.task_runtime.tasks:
+            lines.append(f'- Local tasks: {len(self.task_runtime.tasks)}')
         if self.last_session_path is not None:
             lines.append(f'- Session path: {self.last_session_path}')
         if self.last_run_result is not None:
@@ -2689,3 +3014,48 @@ class LocalCodingAgent:
                 }
             )
         return replace(result, events=tuple(appended))
+
+    def _append_runtime_after_turn_events(
+        self,
+        result: AgentRunResult,
+        *,
+        prompt: str,
+        turn_index: int,
+    ) -> AgentRunResult:
+        updated = self._append_plugin_after_turn_events(
+            result,
+            prompt=prompt,
+            turn_index=turn_index,
+        )
+        if self.hook_policy_runtime is None:
+            return updated
+        injections = self.hook_policy_runtime.after_turn_messages()
+        if not injections:
+            return updated
+        appended = list(updated.events)
+        for entry in injections:
+            appended.append(
+                {
+                    'type': 'hook_policy_after_turn',
+                    'turn_index': turn_index,
+                    'message': entry,
+                    'prompt_preview': self._preview_text(prompt, 120),
+                    'stop_reason': updated.stop_reason,
+                    'trusted': self.hook_policy_runtime.is_trusted(),
+                }
+            )
+        return replace(updated, events=tuple(appended))
+
+
+def _optional_policy_int(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def _optional_policy_float(value: object) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    return None

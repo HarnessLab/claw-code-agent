@@ -245,6 +245,26 @@ class AgentRuntimeTests(unittest.TestCase):
             )
         self.assertFalse(result.ok)
         self.assertIn('--allow-write', result.content)
+        self.assertEqual(result.metadata.get('error_kind'), 'permission_denied')
+
+    def test_build_tool_context_supports_safe_env_overlay_for_shell_tools(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            config = AgentRuntimeConfig(
+                cwd=Path(tmp_dir),
+                permissions=AgentPermissions(allow_shell_commands=True),
+            )
+            context = build_tool_context(
+                config,
+                extra_env={'HOOK_SAFE_TOKEN': 'demo-secret'},
+            )
+            result = execute_tool(
+                default_tool_registry(),
+                'bash',
+                {'command': 'printf %s "$HOOK_SAFE_TOKEN"'},
+                context,
+            )
+        self.assertTrue(result.ok)
+        self.assertIn('demo-secret', result.content)
 
     def test_local_slash_command_returns_without_model_call(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -2379,3 +2399,151 @@ class AgentRuntimeTests(unittest.TestCase):
                 },
             },
         )
+
+    def test_hook_policy_before_prompt_injection_and_after_turn_event(self) -> None:
+        responses = [
+            {
+                'choices': [
+                    {
+                        'message': {
+                            'role': 'assistant',
+                            'content': 'Completed under policy guidance.',
+                        },
+                        'finish_reason': 'stop',
+                    }
+                ],
+                'usage': {'prompt_tokens': 6, 'completion_tokens': 3},
+            }
+        ]
+        recorded_payloads: list[dict[str, object]] = []
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            (workspace / '.claw-policy.json').write_text(
+                (
+                    '{"trusted": false, '
+                    '"managedSettings": {"reviewMode": "strict"}, '
+                    '"safeEnv": ["HOOK_SAFE_TOKEN"], '
+                    '"hooks": {"beforePrompt": ["Respect workspace policy."], '
+                    '"afterTurn": ["Persist the policy decision."]}}'
+                ),
+                encoding='utf-8',
+            )
+            with patch.dict('os.environ', {'HOOK_SAFE_TOKEN': 'demo-secret'}, clear=False):
+                with patch(
+                    'src.openai_compat.request.urlopen',
+                    side_effect=make_recording_urlopen_side_effect(responses, recorded_payloads),
+                ):
+                    agent = LocalCodingAgent(
+                        model_config=ModelConfig(
+                            model='Qwen/Qwen3-Coder-30B-A3B-Instruct',
+                            base_url='http://127.0.0.1:8000/v1',
+                        ),
+                        runtime_config=AgentRuntimeConfig(cwd=workspace),
+                    )
+                    result = agent.run('Inspect the repository.')
+        payload_text = json.dumps(recorded_payloads[0])
+        self.assertIn('Workspace hook/policy guidance', payload_text)
+        self.assertIn('Respect workspace policy.', payload_text)
+        self.assertIn('Trust mode: untrusted', payload_text)
+        self.assertEqual(agent.tool_context.extra_env.get('HOOK_SAFE_TOKEN'), 'demo-secret')
+        self.assertIn('reviewMode=strict', agent.render_trust_report())
+        hook_events = [event for event in result.events if event.get('type') == 'hook_policy_after_turn']
+        self.assertEqual(len(hook_events), 1)
+        self.assertEqual(hook_events[0].get('message'), 'Persist the policy decision.')
+
+    def test_hook_policy_blocks_tool_and_tracks_permission_denial(self) -> None:
+        responses = [
+            {
+                'choices': [
+                    {
+                        'message': {
+                            'role': 'assistant',
+                            'content': 'Trying bash first.',
+                            'tool_calls': [
+                                {
+                                    'id': 'call_1',
+                                    'type': 'function',
+                                    'function': {
+                                        'name': 'bash',
+                                        'arguments': '{"command": "pwd"}',
+                                    },
+                                }
+                            ],
+                        },
+                        'finish_reason': 'tool_calls',
+                    }
+                ],
+                'usage': {'prompt_tokens': 8, 'completion_tokens': 3},
+            },
+            {
+                'choices': [
+                    {
+                        'message': {
+                            'role': 'assistant',
+                            'content': 'Bash was blocked by workspace policy.',
+                        },
+                        'finish_reason': 'stop',
+                    }
+                ],
+                'usage': {'prompt_tokens': 7, 'completion_tokens': 3},
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            (workspace / '.claw-policy.json').write_text(
+                '{"denyTools": ["bash"]}',
+                encoding='utf-8',
+            )
+            with patch('src.openai_compat.request.urlopen', side_effect=make_urlopen_side_effect(responses)):
+                agent = LocalCodingAgent(
+                    model_config=ModelConfig(
+                        model='Qwen/Qwen3-Coder-30B-A3B-Instruct',
+                        base_url='http://127.0.0.1:8000/v1',
+                    ),
+                    runtime_config=AgentRuntimeConfig(cwd=workspace),
+                )
+                result = agent.run('Run pwd')
+        self.assertEqual(result.final_output, 'Bash was blocked by workspace policy.')
+        event_types = [event.get('type') for event in result.events]
+        self.assertIn('hook_policy_tool_block', event_types)
+        self.assertIn('tool_permission_denial', event_types)
+        tool_message = next(
+            message
+            for message in result.transcript
+            if message.get('role') == 'tool'
+        )
+        self.assertTrue(tool_message['metadata'].get('hook_policy_blocked'))
+        self.assertEqual(tool_message['metadata'].get('error_kind'), 'permission_denied')
+
+    def test_hook_policy_budget_override_applies_when_runtime_budget_is_unset(self) -> None:
+        responses = [
+            {
+                'choices': [
+                    {
+                        'message': {
+                            'role': 'assistant',
+                            'content': 'One model call happened.',
+                        },
+                        'finish_reason': 'stop',
+                    }
+                ],
+                'usage': {'prompt_tokens': 4, 'completion_tokens': 2},
+            }
+        ]
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            (workspace / '.claw-policy.json').write_text(
+                '{"budget": {"max_model_calls": 0}}',
+                encoding='utf-8',
+            )
+            with patch('src.openai_compat.request.urlopen', side_effect=make_urlopen_side_effect(responses)):
+                agent = LocalCodingAgent(
+                    model_config=ModelConfig(
+                        model='Qwen/Qwen3-Coder-30B-A3B-Instruct',
+                        base_url='http://127.0.0.1:8000/v1',
+                    ),
+                    runtime_config=AgentRuntimeConfig(cwd=workspace),
+                )
+                result = agent.run('Hello')
+        self.assertEqual(result.stop_reason, 'budget_exceeded')
+        self.assertIn('model-call budget was exceeded', result.final_output)

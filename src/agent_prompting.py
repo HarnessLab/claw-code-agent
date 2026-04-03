@@ -91,6 +91,10 @@ def build_system_prompt_parts(
         get_actions_section(),
         get_using_your_tools_section(enabled_tool_names),
         get_plugin_guidance_section(prompt_context),
+        get_mcp_guidance_section(prompt_context),
+        get_plan_guidance_section(prompt_context),
+        get_task_guidance_section(prompt_context),
+        get_hook_policy_guidance_section(prompt_context),
         get_tone_and_style_section(),
         get_output_efficiency_section(),
         SYSTEM_PROMPT_DYNAMIC_BOUNDARY,
@@ -205,6 +209,56 @@ def get_plugin_guidance_section(prompt_context: PromptContext) -> str:
         'When a task depends on plugin behavior, prefer verifying against files or explicit tool results before making strong claims.',
     ]
     return '\n'.join(['# Plugins', *prepend_bullets(items)])
+
+
+def get_hook_policy_guidance_section(prompt_context: PromptContext) -> str:
+    hook_policy = prompt_context.user_context.get('hookPolicy')
+    trust_mode = prompt_context.user_context.get('trustMode')
+    if not hook_policy and not trust_mode:
+        return ''
+    items = [
+        'Workspace hook and policy manifests may inject trust mode, safe environment values, tool deny rules, and managed settings.',
+        'Treat workspace trust mode as high-priority local runtime guidance when deciding whether to edit files or run shell commands.',
+        'If a workspace policy blocks a tool, do not retry it unchanged. Change approach or explain the limitation.',
+    ]
+    return '\n'.join(['# Hook Policy', *prepend_bullets(items)])
+
+
+def get_mcp_guidance_section(prompt_context: PromptContext) -> str:
+    mcp_runtime = prompt_context.user_context.get('mcpRuntime')
+    if not mcp_runtime:
+        return ''
+    items = [
+        'Local MCP manifests may expose additional resources through the runtime.',
+        'Use MCP resource tools when the task depends on manifest-backed external context or curated workspace resources.',
+        'Treat MCP resource summaries as discoverability hints and prefer reading the specific resource URI before relying on its contents.',
+    ]
+    return '\n'.join(['# MCP', *prepend_bullets(items)])
+
+
+def get_task_guidance_section(prompt_context: PromptContext) -> str:
+    task_runtime = prompt_context.user_context.get('taskRuntime')
+    if not task_runtime:
+        return ''
+    items = [
+        'A local runtime task list may be available to track ongoing work.',
+        'Use task and todo tools to keep the plan state current when the task spans multiple steps or files.',
+        'Prefer updating the stored task list instead of repeating the same progress summary in free-form text.',
+    ]
+    return '\n'.join(['# Tasks', *prepend_bullets(items)])
+
+
+def get_plan_guidance_section(prompt_context: PromptContext) -> str:
+    plan_runtime = prompt_context.user_context.get('planRuntime')
+    if not plan_runtime:
+        return ''
+    items = [
+        'A local runtime plan may be available to track the active multi-step workflow.',
+        'Use the update_plan tool to keep the stored plan current when the task spans multiple milestones.',
+        'When the plan changes materially, update the stored plan rather than relying only on free-form progress text.',
+        'Plan updates can sync into the local task runtime, so keep step statuses accurate.',
+    ]
+    return '\n'.join(['# Planning', *prepend_bullets(items)])
 
 
 def get_output_efficiency_section() -> str:

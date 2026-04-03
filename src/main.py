@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 from pathlib import Path
 from dataclasses import replace
 import json
 from typing import Callable
 
+from .background_runtime import BackgroundSessionRuntime, build_background_worker_command
 from .agent_runtime import LocalCodingAgent
 from .agent_types import (
     AgentPermissions,
@@ -152,6 +154,64 @@ def _build_agent(args: argparse.Namespace) -> LocalCodingAgent:
         append_system_prompt=args.append_system_prompt,
         override_system_prompt=args.override_system_prompt,
     )
+
+
+def _append_agent_forwarded_args(
+    command: list[str],
+    args: argparse.Namespace,
+    *,
+    include_backend: bool,
+) -> None:
+    command.extend(['--cwd', str(args.cwd)])
+    command.extend(['--max-turns', str(getattr(args, 'max_turns', 12))])
+    if include_backend:
+        command.extend(['--model', str(args.model)])
+        command.extend(['--base-url', str(args.base_url)])
+        command.extend(['--api-key', str(args.api_key)])
+        command.extend(['--temperature', str(args.temperature)])
+        command.extend(['--timeout-seconds', str(args.timeout_seconds)])
+        command.extend(['--input-cost-per-million', str(args.input_cost_per_million)])
+        command.extend(['--output-cost-per-million', str(args.output_cost_per_million)])
+    else:
+        command.extend(['--model', str(args.model)])
+    for path in getattr(args, 'add_dir', []):
+        command.extend(['--add-dir', str(path)])
+    for flag in (
+        ('--disable-claude-md', getattr(args, 'disable_claude_md', False)),
+        ('--allow-write', getattr(args, 'allow_write', False)),
+        ('--allow-shell', getattr(args, 'allow_shell', False)),
+        ('--unsafe', getattr(args, 'unsafe', False)),
+        ('--stream', getattr(args, 'stream', False)),
+        ('--show-transcript', getattr(args, 'show_transcript', False)),
+        (
+            '--response-schema-strict',
+            getattr(args, 'response_schema_strict', False),
+        ),
+    ):
+        if flag[1]:
+            command.append(flag[0])
+    for name, value in (
+        ('--auto-snip-threshold', getattr(args, 'auto_snip_threshold', None)),
+        ('--auto-compact-threshold', getattr(args, 'auto_compact_threshold', None)),
+        ('--compact-preserve-messages', getattr(args, 'compact_preserve_messages', None)),
+        ('--max-total-tokens', getattr(args, 'max_total_tokens', None)),
+        ('--max-input-tokens', getattr(args, 'max_input_tokens', None)),
+        ('--max-output-tokens', getattr(args, 'max_output_tokens', None)),
+        ('--max-reasoning-tokens', getattr(args, 'max_reasoning_tokens', None)),
+        ('--max-budget-usd', getattr(args, 'max_budget_usd', None)),
+        ('--max-tool-calls', getattr(args, 'max_tool_calls', None)),
+        ('--max-delegated-tasks', getattr(args, 'max_delegated_tasks', None)),
+        ('--max-model-calls', getattr(args, 'max_model_calls', None)),
+        ('--max-session-turns', getattr(args, 'max_session_turns', None)),
+        ('--response-schema-file', getattr(args, 'response_schema_file', None)),
+        ('--response-schema-name', getattr(args, 'response_schema_name', None)),
+        ('--scratchpad-root', getattr(args, 'scratchpad_root', None)),
+        ('--system-prompt', getattr(args, 'system_prompt', None)),
+        ('--append-system-prompt', getattr(args, 'append_system_prompt', None)),
+        ('--override-system-prompt', getattr(args, 'override_system_prompt', None)),
+    ):
+        if value is not None:
+            command.extend([name, str(value)])
 
 
 def _add_agent_resume_args(parser: argparse.ArgumentParser) -> None:
@@ -487,6 +547,34 @@ def build_parser() -> argparse.ArgumentParser:
     agent_parser.add_argument('--show-transcript', action='store_true')
     _add_agent_common_args(agent_parser, include_backend=True)
 
+    background_parser = subparsers.add_parser('agent-bg', help='run the Python local-model agent as a local background session')
+    background_parser.add_argument('prompt')
+    background_parser.add_argument('--max-turns', type=int, default=12)
+    background_parser.add_argument('--show-transcript', action='store_true')
+    _add_agent_common_args(background_parser, include_backend=True)
+
+    background_worker_parser = subparsers.add_parser('agent-bg-worker', help=argparse.SUPPRESS)
+    background_worker_parser.add_argument('background_id')
+    background_worker_parser.add_argument('prompt')
+    background_worker_parser.add_argument('--background-root', required=True)
+    background_worker_parser.add_argument('--max-turns', type=int, default=12)
+    background_worker_parser.add_argument('--show-transcript', action='store_true')
+    _add_agent_common_args(background_worker_parser, include_backend=True)
+
+    ps_parser = subparsers.add_parser('agent-ps', help='list local background agent sessions')
+    ps_parser.add_argument('--tail', type=int, default=None)
+
+    logs_parser = subparsers.add_parser('agent-logs', help='show logs for a local background agent session')
+    logs_parser.add_argument('background_id')
+    logs_parser.add_argument('--tail', type=int, default=None)
+
+    attach_parser = subparsers.add_parser('agent-attach', help='show the current output snapshot for a local background agent session')
+    attach_parser.add_argument('background_id')
+    attach_parser.add_argument('--tail', type=int, default=None)
+
+    kill_parser = subparsers.add_parser('agent-kill', help='stop a local background agent session')
+    kill_parser.add_argument('background_id')
+
     chat_parser = subparsers.add_parser('agent-chat', help='run an interactive Python local-model chat loop')
     chat_parser.add_argument('prompt', nargs='?')
     chat_parser.add_argument('--resume-session-id')
@@ -639,6 +727,82 @@ def main(argv: list[str] | None = None) -> int:
         agent = _build_agent(args)
         result = agent.run(args.prompt)
         _print_agent_result(result, show_transcript=args.show_transcript)
+        return 0
+    if args.command == 'agent-bg':
+        background_runtime = BackgroundSessionRuntime()
+        background_id = background_runtime.create_id()
+        forwarded_args: list[str] = []
+        _append_agent_forwarded_args(forwarded_args, args, include_backend=True)
+        forwarded_args.extend(['--background-root', str(background_runtime.root)])
+        command = build_background_worker_command(
+            background_id=background_id,
+            prompt=args.prompt,
+            forwarded_args=forwarded_args,
+        )
+        record = background_runtime.launch(
+            command,
+            prompt=args.prompt,
+            workspace_cwd=Path(args.cwd).resolve(),
+            model=args.model,
+            background_id=background_id,
+            process_cwd=Path(__file__).resolve().parent.parent,
+        )
+        print('# Background Session')
+        print(f'background_id={record.background_id}')
+        print(f'pid={record.pid}')
+        print(f'log_path={record.log_path}')
+        print(f'record_path={record.record_path}')
+        return 0
+    if args.command == 'agent-bg-worker':
+        background_runtime = BackgroundSessionRuntime(Path(args.background_root))
+        exit_code = 1
+        stop_reason = 'worker_failed'
+        session_id = None
+        session_path = None
+        try:
+            agent = _build_agent(args)
+            result = agent.run(args.prompt)
+            _print_agent_result(result, show_transcript=args.show_transcript)
+            exit_code = 0
+            stop_reason = result.stop_reason or 'completed'
+            session_id = result.session_id
+            session_path = result.session_path
+            return 0
+        finally:
+            background_runtime.mark_finished(
+                args.background_id,
+                exit_code=exit_code,
+                stop_reason=stop_reason,
+                session_id=session_id,
+                session_path=session_path,
+            )
+    if args.command == 'agent-ps':
+        print(BackgroundSessionRuntime().render_ps())
+        return 0
+    if args.command == 'agent-logs':
+        print(
+            BackgroundSessionRuntime().render_logs(
+                args.background_id,
+                tail=args.tail,
+            )
+        )
+        return 0
+    if args.command == 'agent-attach':
+        print(
+            BackgroundSessionRuntime().render_attach(
+                args.background_id,
+                tail=args.tail,
+            )
+        )
+        return 0
+    if args.command == 'agent-kill':
+        record = BackgroundSessionRuntime().kill(args.background_id)
+        print('# Background Session')
+        print(f'background_id={record.background_id}')
+        print(f'status={record.status}')
+        print(f'pid={record.pid}')
+        if record.exit_code is not None:
+            print(f'exit_code={record.exit_code}')
         return 0
     if args.command == 'agent-chat':
         agent = _build_agent(args)

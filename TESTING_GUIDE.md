@@ -54,6 +54,8 @@ pip install -e .
 ```bash
 python3 -m src.main --help
 python3 -m src.main agent --help
+python3 -m src.main agent-bg --help
+python3 -m src.main agent-ps --help
 python3 -m src.main agent-chat --help
 python3 -m src.main agent-resume --help
 ```
@@ -73,8 +75,12 @@ python3 -m src.main agent "/help"
 python3 -m src.main agent "/commands"
 python3 -m src.main agent "/context" --cwd ..
 python3 -m src.main agent "/context-raw" --cwd ..
+python3 -m src.main agent "/plan" --cwd ..
 python3 -m src.main agent "/prompt" --cwd ..
 python3 -m src.main agent "/permissions" --cwd ..
+python3 -m src.main agent "/hooks" --cwd ..
+python3 -m src.main agent "/policy" --cwd ..
+python3 -m src.main agent "/trust" --cwd ..
 python3 -m src.main agent "/tools" --cwd ..
 python3 -m src.main agent "/memory" --cwd ..
 python3 -m src.main agent "/status" --cwd ..
@@ -111,6 +117,67 @@ python3 -m src.main agent-context --cwd .. --add-dir /path/to/directory
 
 ```bash
 python3 -m src.main agent-context --cwd .. --disable-claude-md
+```
+
+### 4.6 Hook/policy context and trust inspection
+
+Create a local policy file:
+
+```bash
+mkdir -p ./test_cases
+cat > ./test_cases/.claw-policy.json <<'EOF'
+{
+  "trusted": false,
+  "managedSettings": {
+    "reviewMode": "strict"
+  },
+  "safeEnv": ["HOOK_SAFE_TOKEN"],
+  "hooks": {
+    "beforePrompt": ["Respect workspace policy before acting."],
+    "afterTurn": ["Persist the policy decision after each turn."],
+    "beforeTool": {
+      "read_file": ["Validate the path before reading."]
+    }
+  }
+}
+EOF
+export HOOK_SAFE_TOKEN=demo-secret
+```
+
+Inspect the runtime view:
+
+```bash
+python3 -m src.main agent "/hooks" --cwd ./test_cases
+python3 -m src.main agent "/trust" --cwd ./test_cases
+python3 -m src.main agent "/permissions" --cwd ./test_cases
+python3 -m src.main agent "/tools" --cwd ./test_cases
+python3 -m src.main agent-context-raw --cwd ./test_cases
+python3 -m src.main agent-prompt --cwd ./test_cases
+```
+
+### 4.7 Safe environment values in shell tools
+
+```bash
+python3 -m src.main agent \
+  "Run bash and print HOOK_SAFE_TOKEN, then explain where it came from." \
+  --cwd ./test_cases \
+  --allow-shell \
+  --show-transcript
+```
+
+### 4.8 Plan runtime context and prompt inspection
+
+```bash
+python3 -m src.main agent \
+  "Use update_plan to store a two-step plan for inspecting and editing the workspace." \
+  --cwd ./test_cases \
+  --allow-write \
+  --show-transcript
+
+python3 -m src.main agent "/plan" --cwd ./test_cases
+python3 -m src.main agent "/tasks" --cwd ./test_cases
+python3 -m src.main agent-context-raw --cwd ./test_cases
+python3 -m src.main agent-prompt --cwd ./test_cases
 ```
 
 ## 5. Core Agent Loop
@@ -227,6 +294,52 @@ python3 -m src.main agent \
   --unsafe
 ```
 
+### 6.7 Hook/policy tool blocking
+
+Update the policy to block `bash`:
+
+```bash
+cat > ./test_cases/.claw-policy.json <<'EOF'
+{
+  "trusted": false,
+  "denyTools": ["bash"],
+  "hooks": {
+    "beforePrompt": ["Respect workspace policy before acting."],
+    "afterTurn": ["Persist the policy decision after each turn."]
+  }
+}
+EOF
+```
+
+Then test the block:
+
+```bash
+python3 -m src.main agent \
+  "Try to run bash and then explain what was blocked." \
+  --cwd ./test_cases \
+  --allow-shell \
+  --show-transcript
+```
+
+Look for:
+
+- `hook_policy_tool_block`
+- `tool_permission_denial`
+- `plugin_tool_runtime` messages that now also include hook/policy guidance when present
+
+### 6.8 Plan tools
+
+```bash
+python3 -m src.main agent \
+  "Use update_plan to store these steps: inspect the repository, implement the change, run verification. Mark the first step in_progress and sync the plan to tasks." \
+  --cwd ./test_cases \
+  --allow-write \
+  --show-transcript
+
+python3 -m src.main agent "/plan" --cwd ./test_cases
+python3 -m src.main agent "/tasks" --cwd ./test_cases
+```
+
 ## 7. Session Persistence And Resume
 
 ### 7.1 Create a saved session
@@ -261,7 +374,50 @@ python3 -m src.main agent-resume \
 ls -lt .port_sessions/agent
 ```
 
-## 8. Structured Output / JSON Schema
+## 8. Background Sessions
+
+### 8.1 Launch a background session
+
+Use a local slash-command prompt first so you can verify the background workflow without depending on the model backend:
+
+```bash
+python3 -m src.main agent-bg "/help" --cwd ./test_cases
+```
+
+This prints:
+
+- `background_id=...`
+- `pid=...`
+- `log_path=...`
+- `record_path=...`
+
+### 8.2 List background sessions
+
+```bash
+python3 -m src.main agent-ps
+```
+
+### 8.3 Read background logs
+
+```bash
+python3 -m src.main agent-logs <background-id>
+python3 -m src.main agent-logs <background-id> --tail 40
+```
+
+### 8.4 Attach to the current output snapshot
+
+```bash
+python3 -m src.main agent-attach <background-id>
+python3 -m src.main agent-attach <background-id> --tail 40
+```
+
+### 8.5 Kill a running background session
+
+```bash
+python3 -m src.main agent-kill <background-id>
+```
+
+## 9. Structured Output / JSON Schema
 
 Create a schema file:
 
@@ -290,9 +446,9 @@ python3 -m src.main agent \
   --response-schema-strict
 ```
 
-## 9. Budgets And Limits
+## 10. Budgets And Limits
 
-### 9.1 Total token budget
+### 10.1 Total token budget
 
 ```bash
 python3 -m src.main agent \
@@ -301,7 +457,7 @@ python3 -m src.main agent \
   --max-total-tokens 50
 ```
 
-### 9.2 Input / output token budgets
+### 10.2 Input / output token budgets
 
 ```bash
 python3 -m src.main agent \
@@ -311,7 +467,7 @@ python3 -m src.main agent \
   --max-output-tokens 80
 ```
 
-### 9.3 Reasoning-token budget
+### 10.3 Reasoning-token budget
 
 ```bash
 python3 -m src.main agent \
@@ -320,7 +476,7 @@ python3 -m src.main agent \
   --max-reasoning-tokens 10
 ```
 
-### 9.4 Tool-call budget
+### 10.4 Tool-call budget
 
 ```bash
 python3 -m src.main agent \
@@ -329,7 +485,7 @@ python3 -m src.main agent \
   --max-tool-calls 1
 ```
 
-### 9.5 Delegated-task budget
+### 10.5 Delegated-task budget
 
 ```bash
 python3 -m src.main agent \
@@ -338,7 +494,7 @@ python3 -m src.main agent \
   --max-delegated-tasks 1
 ```
 
-### 9.6 Cost budget
+### 10.6 Cost budget
 
 ```bash
 python3 -m src.main agent \
@@ -349,7 +505,7 @@ python3 -m src.main agent \
   --max-budget-usd 0.000001
 ```
 
-### 9.7 Model-call budget
+### 10.7 Model-call budget
 
 ```bash
 python3 -m src.main agent \
@@ -358,7 +514,7 @@ python3 -m src.main agent \
   --max-model-calls 1
 ```
 
-### 9.8 Session-turn budget
+### 10.8 Session-turn budget
 
 ```bash
 python3 -m src.main agent \
@@ -367,9 +523,27 @@ python3 -m src.main agent \
   --max-session-turns 1
 ```
 
-## 10. Streaming, Continuation, And Context Reduction
+### 10.9 Budget overrides from local policy
 
-### 10.1 Streaming assistant output
+```bash
+cat > ./test_cases/.claw-policy.json <<'EOF'
+{
+  "budget": {
+    "max_model_calls": 0
+  }
+}
+EOF
+
+python3 -m src.main agent \
+  "Say hello once." \
+  --cwd ./test_cases
+```
+
+Expected result: the run stops with a model-call budget exceeded message even though you did not pass `--max-model-calls` on the CLI.
+
+## 11. Streaming, Continuation, And Context Reduction
+
+### 11.1 Streaming assistant output
 
 ```bash
 python3 -m src.main agent \
@@ -379,7 +553,7 @@ python3 -m src.main agent \
   --show-transcript
 ```
 
-### 10.2 Automatic continuation after truncation
+### 11.2 Automatic continuation after truncation
 
 Use a small output budget so the backend is more likely to stop early:
 
@@ -391,7 +565,7 @@ python3 -m src.main agent \
   --show-transcript
 ```
 
-### 10.3 Snipping older context
+### 11.3 Snipping older context
 
 ```bash
 python3 -m src.main agent \
@@ -402,7 +576,7 @@ python3 -m src.main agent \
   --show-transcript
 ```
 
-### 10.4 Compaction boundaries
+### 11.4 Compaction boundaries
 
 ```bash
 python3 -m src.main agent \
@@ -413,9 +587,9 @@ python3 -m src.main agent \
   --show-transcript
 ```
 
-## 11. File History Replay
+## 12. File History Replay
 
-### 11.1 Create file history
+### 12.1 Create file history
 
 ```bash
 python3 -m src.main agent \
@@ -424,7 +598,7 @@ python3 -m src.main agent \
   --allow-write
 ```
 
-### 11.2 Resume and inspect replay
+### 12.2 Resume and inspect replay
 
 ```bash
 python3 -m src.main agent-resume \
@@ -436,9 +610,9 @@ python3 -m src.main agent-resume \
 
 Look for `file_history_replay` messages in the transcript.
 
-## 12. Nested Delegation
+## 13. Nested Delegation
 
-### 12.1 Basic delegated subtask
+### 13.1 Basic delegated subtask
 
 ```bash
 python3 -m src.main agent \
@@ -447,7 +621,7 @@ python3 -m src.main agent \
   --show-transcript
 ```
 
-### 12.2 Multiple delegated subtasks
+### 13.2 Multiple delegated subtasks
 
 ```bash
 python3 -m src.main agent \
@@ -456,7 +630,7 @@ python3 -m src.main agent \
   --show-transcript
 ```
 
-### 12.3 Resume a delegated child session
+### 13.3 Resume a delegated child session
 
 1. Seed a normal saved session:
 
@@ -475,7 +649,7 @@ python3 -m src.main agent \
   --show-transcript
 ```
 
-### 12.4 Topological dependency batches
+### 13.4 Topological dependency batches
 
 ```bash
 python3 -m src.main agent \
@@ -490,7 +664,7 @@ Look for:
 - `delegate_group_result`
 - `batch_index=...`
 
-## 13. Plugin Runtime
+## 14. Plugin Runtime
 
 Create a local plugin manifest:
 
@@ -531,14 +705,14 @@ cat > ./test_cases/plugins/demo/plugin.json <<'EOF'
 EOF
 ```
 
-### 13.1 Plugin prompt/context discovery
+### 14.1 Plugin prompt/context discovery
 
 ```bash
 python3 -m src.main agent-prompt --cwd ./test_cases
 python3 -m src.main agent-context-raw --cwd ./test_cases
 ```
 
-### 13.2 Plugin alias tool
+### 14.2 Plugin alias tool
 
 ```bash
 echo "hello plugin" > ./test_cases/hello.txt
@@ -548,7 +722,7 @@ python3 -m src.main agent \
   --show-transcript
 ```
 
-### 13.3 Plugin virtual tool
+### 14.3 Plugin virtual tool
 
 ```bash
 python3 -m src.main agent \
@@ -557,7 +731,7 @@ python3 -m src.main agent \
   --show-transcript
 ```
 
-### 13.4 Plugin before/after tool guidance
+### 14.4 Plugin before/after tool guidance
 
 ```bash
 python3 -m src.main agent \
@@ -566,7 +740,7 @@ python3 -m src.main agent \
   --show-transcript
 ```
 
-### 13.5 Plugin lifecycle with resume/persist
+### 14.5 Plugin lifecycle with resume/persist
 
 1. Start a session:
 
@@ -591,9 +765,138 @@ Look for:
 - `Plugin resume hooks:`
 - `Plugin runtime state:`
 
-## 14. Query Engine And Workspace Commands
+## 15. MCP Runtime
 
-### 14.1 Workspace inventory
+Create a local MCP manifest:
+
+```bash
+mkdir -p ./test_cases_mcp
+printf 'mcp notes\n' > ./test_cases_mcp/notes.txt
+cat > ./test_cases_mcp/.claw-mcp.json <<'EOF'
+{
+  "servers": [
+    {
+      "name": "workspace",
+      "resources": [
+        {
+          "uri": "mcp://workspace/notes",
+          "name": "Notes",
+          "path": "notes.txt",
+          "mimeType": "text/plain"
+        },
+        {
+          "uri": "mcp://workspace/inline",
+          "name": "Inline",
+          "text": "inline body"
+        }
+      ]
+    }
+  ]
+}
+EOF
+```
+
+### 15.1 MCP context and slash commands
+
+```bash
+python3 -m src.main agent "/mcp" --cwd ./test_cases_mcp
+python3 -m src.main agent "/resources" --cwd ./test_cases_mcp
+python3 -m src.main agent "/resource mcp://workspace/notes" --cwd ./test_cases_mcp
+python3 -m src.main agent "/mcp (MCP)" --cwd ./test_cases_mcp
+python3 -m src.main agent-context-raw --cwd ./test_cases_mcp
+python3 -m src.main agent-prompt --cwd ./test_cases_mcp
+```
+
+### 15.2 MCP tools through the model loop
+
+```bash
+python3 -m src.main agent \
+  "List the available MCP resources, then read mcp://workspace/notes and summarize it." \
+  --cwd ./test_cases_mcp \
+  --show-transcript
+```
+
+### 15.3 Read inline MCP resources
+
+```bash
+python3 -m src.main agent \
+  "Read the MCP resource mcp://workspace/inline and repeat its content." \
+  --cwd ./test_cases_mcp \
+  --show-transcript
+```
+
+## 16. Task Runtime
+
+Create a clean task workspace:
+
+```bash
+mkdir -p ./test_cases_tasks
+rm -rf ./test_cases_tasks/.port_sessions
+```
+
+### 16.1 Task slash commands
+
+```bash
+python3 -m src.main agent "/tasks" --cwd ./test_cases_tasks
+python3 -m src.main agent "/todo" --cwd ./test_cases_tasks
+python3 -m src.main agent "/task missing-task-id" --cwd ./test_cases_tasks
+python3 -m src.main agent-context-raw --cwd ./test_cases_tasks
+python3 -m src.main agent-prompt --cwd ./test_cases_tasks
+```
+
+### 16.2 Create and update tasks through the model loop
+
+```bash
+python3 -m src.main agent \
+  "Create a task called Review runtime tasks, then list the current tasks." \
+  --cwd ./test_cases_tasks \
+  --allow-write \
+  --show-transcript
+```
+
+Then inspect the stored task file:
+
+```bash
+cat ./test_cases_tasks/.port_sessions/task_runtime.json
+```
+
+### 16.3 Replace the todo list
+
+```bash
+python3 -m src.main agent \
+  "Replace the current todo list with three tasks: inspect runtime, verify tests, and update docs. Mark inspect runtime as done and the others as todo." \
+  --cwd ./test_cases_tasks \
+  --allow-write \
+  --show-transcript
+```
+
+### 16.4 Read back task state
+
+```bash
+python3 -m src.main agent "/tasks" --cwd ./test_cases_tasks
+python3 -m src.main agent \
+  "List the current tasks and show me the id of each one." \
+  --cwd ./test_cases_tasks \
+  --show-transcript
+```
+
+### 16.5 Plan runtime and task sync
+
+```bash
+python3 -m src.main agent \
+  "Use update_plan to create three steps: inspect runtime, verify tests, update docs. Mark inspect runtime completed and sync to tasks." \
+  --cwd ./test_cases_tasks \
+  --allow-write \
+  --show-transcript
+
+python3 -m src.main agent "/plan" --cwd ./test_cases_tasks
+python3 -m src.main agent "/tasks" --cwd ./test_cases_tasks
+cat ./test_cases_tasks/.port_sessions/plan_runtime.json
+```
+
+## 17. Query Engine And Workspace Commands
+
+### 17.1 Workspace inventory
 
 ```bash
 python3 -m src.main summary
@@ -603,7 +906,7 @@ python3 -m src.main commands --limit 20
 python3 -m src.main tools --limit 20
 ```
 
-### 14.2 Query routing and bootstrap reports
+### 17.2 Query routing and bootstrap reports
 
 ```bash
 python3 -m src.main route "inspect the runtime and tools" --limit 10
@@ -611,14 +914,14 @@ python3 -m src.main bootstrap "inspect the runtime and tools" --limit 10
 python3 -m src.main turn-loop "inspect the runtime and tools" --limit 5 --max-turns 3
 ```
 
-### 14.3 Session flushing for the mirrored workspace
+### 17.3 Session flushing for the mirrored workspace
 
 ```bash
 python3 -m src.main flush-transcript "store a temporary transcript"
 python3 -m src.main load-session <session-id>
 ```
 
-## 15. Remote/Direct Mode Simulations
+## 18. Remote/Direct Mode Simulations
 
 These are mirrored workspace simulation commands, not the real agent runtime:
 
@@ -630,7 +933,7 @@ python3 -m src.main direct-connect-mode demo-target
 python3 -m src.main deep-link-mode demo-target
 ```
 
-## 16. Parity Tracking Workflow
+## 19. Parity Tracking Workflow
 
 Use this every time a new feature lands:
 

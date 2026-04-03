@@ -61,6 +61,23 @@ Done:
 - [x] Manifest-defined plugin `beforeTool` guidance
 - [x] Manifest-defined plugin tool-result guidance injected back into the transcript
 - [x] Plugin runtime session-state persistence and resume restoration
+- [x] Manifest-based hook/policy runtime discovery
+- [x] Hook/policy before-prompt runtime injection
+- [x] Hook/policy after-turn runtime events
+- [x] Hook/policy tool preflight guidance
+- [x] Hook/policy tool blocking
+- [x] Hook/policy after-tool guidance
+- [x] Hook/policy budget override loading
+- [x] Hook/policy safe-environment overlay for shell tools
+- [x] Local manifest-backed MCP resource discovery
+- [x] Local MCP resource listing and reading
+- [x] MCP-backed runtime tools for local resource access
+- [x] Local persistent task runtime discovery
+- [x] Local task create/get/list/update runtime flows
+- [x] Local todo-list replacement runtime flow
+- [x] Local persistent plan runtime discovery
+- [x] Local plan get/update/clear runtime flows
+- [x] Local plan-to-task sync flow
 - [x] Compaction metadata with compacted message ids
 - [x] Compaction metadata with preserved-tail ids and compaction depth
 - [x] Compaction metadata with compacted/preserved lineage ids and revision summaries
@@ -103,16 +120,16 @@ Done:
 - [x] `agent-prompt` command
 - [x] `agent-context` command
 - [x] `agent-context-raw` command
+- [x] Local background session mode
+- [x] Local background session listing (`agent-ps`)
+- [x] Local background session logs (`agent-logs`)
+- [x] Local background attach snapshot (`agent-attach`)
+- [x] Local background kill flow (`agent-kill`)
 - [x] Inventory/helper commands such as `summary`, `manifest`, `commands`, and `tools`
 
 Missing:
 
 - [ ] Daemon worker mode
-- [ ] Background session mode
-- [ ] Session process listing (`ps`)
-- [ ] Background session logs
-- [ ] Background attach flow
-- [ ] Background kill flow
 - [ ] Remote-control / bridge runtime mode
 - [ ] Browser/native-host runtime mode
 - [ ] Computer-use MCP mode
@@ -133,6 +150,10 @@ Done:
 - [x] Environment-aware prompt sections
 - [x] User context reminder injection
 - [x] Custom system prompt override and append support
+- [x] Local hook/policy guidance section in the Python system prompt
+- [x] Local MCP guidance section in the Python system prompt
+- [x] Local planning guidance section in the Python system prompt
+- [x] Local task guidance section in the Python system prompt
 
 Missing:
 
@@ -160,6 +181,11 @@ Done:
 - [x] Raw context inspection command
 - [x] Plugin cache snapshot injection
 - [x] Manifest-based plugin runtime summary injection
+- [x] Manifest-based hook/policy summary injection
+- [x] Trust-mode, managed-settings, and safe-env context injection
+- [x] Manifest-based MCP runtime summary injection
+- [x] Manifest-based plan runtime summary injection
+- [x] Manifest-based task runtime summary injection
 
 Missing:
 
@@ -182,9 +208,20 @@ Done:
 - [x] `/usage`
 - [x] `/context-raw`
 - [x] `/env`
+- [x] `/mcp`
+- [x] `/resources`
+- [x] `/resource`
+- [x] `/plan`
+- [x] `/planner`
+- [x] `/tasks`
+- [x] `/todo`
+- [x] `/task`
 - [x] `/prompt`
 - [x] `/system-prompt`
 - [x] `/permissions`
+- [x] `/hooks`
+- [x] `/policy`
+- [x] `/trust`
 - [x] `/model`
 - [x] `/tools`
 - [x] `/memory`
@@ -196,7 +233,7 @@ Missing:
 
 - [ ] Full npm slash-command surface
 - [ ] Slash commands backed by MCP integration
-- [ ] Slash commands tied to task/plan systems
+- [ ] Slash commands tied to task/plan systems beyond the current local `/plan`, `/tasks`, and `/task` flows
 - [ ] Slash commands tied to remote/background sessions
 - [ ] Slash commands with richer interactive behavior
 - [ ] Slash commands tied to plugins and bundled skills
@@ -213,22 +250,29 @@ Done:
 - [x] `glob_search`
 - [x] `grep_search`
 - [x] `bash`
+- [x] `mcp_list_resources`
+- [x] `mcp_read_resource`
+- [x] `plan_get`
+- [x] `update_plan`
+- [x] `plan_clear`
+- [x] `delegate_agent`
+- [x] `task_list`
+- [x] `task_get`
+- [x] `task_create`
+- [x] `task_update`
+- [x] `todo_write`
 
 Missing:
 
-- [ ] Agent spawning tool
+- [ ] Agent spawning tool parity beyond the current `delegate_agent` runtime tool
 - [ ] Skill tool
 - [ ] Notebook edit tool
 - [ ] Web fetch tool
 - [ ] Web search tool
-- [ ] Todo write tool
 - [ ] Ask-user-question tool
 - [ ] LSP tool
-- [ ] MCP resource listing tool
-- [ ] MCP resource read tool
 - [ ] Tool search tool
 - [ ] Config tool
-- [ ] Task create/get/update/list tools
 - [ ] Team create/delete tools
 - [ ] Send-message tool
 - [ ] Terminal capture tool
@@ -246,14 +290,18 @@ Done:
 
 - [x] Basic local command dispatch for the Python runtime
 - [x] Inventory view of mirrored command names
+- [x] Local persistent task runtime with create/get/list/update flows
+- [x] Local todo-list replacement flow
+- [x] Local persistent plan runtime with get/update/clear flows
+- [x] Local plan-to-task sync flow
+- [x] Local background task management for agent worker sessions
 
 Missing:
 
 - [ ] Real implementation of the larger upstream command tree
-- [ ] Task orchestration system
-- [ ] Planner / task execution parity
+- [ ] Task orchestration system beyond the current local plan/task sync runtime
+- [ ] Planner / task execution parity beyond the current local plan persistence and sync flow
 - [ ] Team / collaboration command flows
-- [ ] Background task management
 - [ ] Command-specific session behaviors
 - [ ] Full `src/commands/*` parity
 - [ ] Full `src/tasks/*` parity
@@ -266,16 +314,19 @@ Done:
 - [x] Write-gated mode
 - [x] Shell-gated mode
 - [x] Unsafe mode for destructive shell actions
+- [x] Local hook/policy manifest discovery
+- [x] Hook before-prompt and after-turn runtime handling
+- [x] Hook/policy tool preflight, deny, and after-tool handling
+- [x] Policy budget override loading
+- [x] Managed settings loading and reporting
+- [x] Safe environment loading for shell tool context
+- [x] Trust reporting and hook/policy slash commands
+- [x] Permission-denial runtime events for policy/tool blocks
 
 Missing:
 
-- [ ] Hooks runtime
 - [ ] Tool-permission workflow parity
-- [ ] Policy limit loading
-- [ ] Managed settings loading
 - [ ] Trust-gated initialization
-- [ ] Safe environment loading parity
-- [ ] More exact denial tracking
 - [ ] Hook-config management
 - [ ] Full hooks and policy parity
 
@@ -284,13 +335,15 @@ Missing:
 Done:
 
 - [x] Placeholder mirrored package layout for plugins, skills, services, and remote subsystems
+- [x] Local manifest-backed MCP discovery
+- [x] Local MCP resource listing and reading
+- [x] MCP-backed runtime tools for local resource access
 
 Missing:
 
 - [ ] Real MCP client support
 - [ ] MCP server integration
-- [ ] MCP resource listing and reading
-- [ ] MCP-backed tools
+- [ ] Full MCP-backed tool parity beyond the current local resource list/read tools
 - [ ] Plugin discovery and loading
 - [ ] Bundled plugin support
 - [ ] Plugin lifecycle management
@@ -323,12 +376,12 @@ Missing:
 Done:
 
 - [x] Session save/resume on local disk
+- [x] Local background agent processes
+- [x] Local background attach/log/kill workflows
 
 Missing:
 
 - [ ] Remote execution modes
-- [ ] Background agent processes
-- [ ] Background attach/log/kill workflows
 - [ ] Team runtime features
 - [ ] Team messaging features
 - [ ] Shared remote state
@@ -383,6 +436,13 @@ Working Python runtime today:
 - [x] `src/agent_session.py`
 - [x] `src/agent_slash_commands.py`
 - [x] `src/agent_types.py`
+- [x] `src/mcp_runtime.py`
+- [x] `src/plan_runtime.py`
+- [x] `src/plugin_runtime.py`
+- [x] `src/hook_policy.py`
+- [x] `src/background_runtime.py`
+- [x] `src/task.py`
+- [x] `src/task_runtime.py`
 - [x] `src/openai_compat.py`
 - [x] `src/session_store.py`
 - [x] `src/permissions.py`
@@ -405,9 +465,10 @@ Mirrored inventory / scaffold areas that still need real implementation work:
 - [ ] Expand the real Python tool registry toward upstream `tools.ts`
 - [ ] Replace more snapshot-backed mirrored modules with working runtime code
 - [ ] Implement real MCP support
-- [ ] Implement hooks and policy flows
+- [ ] Expand hooks and policy parity beyond the current manifest/runtime implementation
 - [ ] Build a real interactive REPL / TUI
 - [ ] Add tokenizer-accurate context accounting
-- [ ] Add background and remote session modes
+- [ ] Expand background session parity beyond the current local worker/log/attach model
+- [ ] Add real remote session modes
 - [ ] Port more of the command/task system
 - [ ] Close the gap between the mirrored workspace and the working runtime
