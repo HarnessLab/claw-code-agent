@@ -92,6 +92,7 @@ class AgentSessionState:
     user_context: dict[str, str] = field(default_factory=dict)
     system_context: dict[str, str] = field(default_factory=dict)
     messages: list[AgentMessage] = field(default_factory=list)
+    mutation_serial: int = 0
 
     @classmethod
     def create(
@@ -200,6 +201,7 @@ class AgentSessionState:
             previous_content=message.content,
             previous_state=message.state,
             previous_stop_reason=message.stop_reason,
+            mutation_serial=self._next_mutation_serial(),
         )
         merged_metadata = _advance_lineage_revision(merged_metadata)
         self.messages[index] = replace(
@@ -246,6 +248,7 @@ class AgentSessionState:
             previous_content=message.content,
             previous_state=message.state,
             previous_stop_reason=message.stop_reason,
+            mutation_serial=self._next_mutation_serial(),
         )
         merged_metadata = _advance_lineage_revision(merged_metadata)
         self.messages[index] = replace(
@@ -269,6 +272,7 @@ class AgentSessionState:
             previous_content=message.content,
             previous_state=message.state,
             previous_stop_reason=message.stop_reason,
+            mutation_serial=self._next_mutation_serial(),
         )
         merged_metadata = _advance_lineage_revision(merged_metadata)
         self.messages[index] = replace(
@@ -362,6 +366,7 @@ class AgentSessionState:
             previous_content=message.content,
             previous_state=message.state,
             previous_stop_reason=message.stop_reason,
+            mutation_serial=self._next_mutation_serial(),
         )
         merged_metadata = _advance_lineage_revision(merged_metadata)
         if metadata:
@@ -391,6 +396,7 @@ class AgentSessionState:
                 previous_content=message.content,
                 previous_state=message.state,
                 previous_stop_reason=message.stop_reason,
+                mutation_serial=self._next_mutation_serial(),
             )
             merged_metadata = _advance_lineage_revision(merged_metadata)
         if metadata:
@@ -430,6 +436,7 @@ class AgentSessionState:
                 previous_content=message.content,
                 previous_state=message.state,
                 previous_stop_reason=message.stop_reason,
+                mutation_serial=self._next_mutation_serial(),
             )
             merged_metadata = _advance_lineage_revision(merged_metadata)
         if metadata:
@@ -474,6 +481,10 @@ class AgentSessionState:
     def transcript(self) -> tuple[JSONDict, ...]:
         return tuple(message.to_transcript_entry() for message in self.messages)
 
+    def _next_mutation_serial(self) -> int:
+        self.mutation_serial += 1
+        return self.mutation_serial
+
     @classmethod
     def from_persisted(
         cls,
@@ -488,6 +499,17 @@ class AgentSessionState:
             user_context=dict(user_context or {}),
             system_context=dict(system_context or {}),
             messages=[AgentMessage.from_openai_message(message) for message in messages],
+            mutation_serial=max(
+                (
+                    int(message.get('metadata', {}).get('last_mutation_serial', 0))
+                    for message in messages
+                    if isinstance(message, dict)
+                    and isinstance(message.get('metadata'), dict)
+                    and isinstance(message.get('metadata', {}).get('last_mutation_serial', 0), int)
+                    and not isinstance(message.get('metadata', {}).get('last_mutation_serial', 0), bool)
+                ),
+                default=0,
+            ),
         )
 
 
@@ -522,6 +544,7 @@ def _record_mutation(
     previous_content: str,
     previous_state: str,
     previous_stop_reason: str | None,
+    mutation_serial: int,
 ) -> JSONDict:
     mutations = metadata.get('mutations')
     if not isinstance(mutations, list):
@@ -538,6 +561,7 @@ def _record_mutation(
             'previous_stop_reason': previous_stop_reason,
             'previous_content_length': len(previous_content),
             'previous_content_preview': preview or '(empty)',
+            'serial': mutation_serial,
         }
     )
     if len(mutations) > MAX_MUTATION_HISTORY:
@@ -545,6 +569,11 @@ def _record_mutation(
     metadata['mutations'] = mutations
     metadata['mutation_count'] = len(mutations)
     metadata['last_mutation_kind'] = mutation_kind
+    metadata['last_mutation_serial'] = mutation_serial
+    max_mutation_serial = metadata.get('max_mutation_serial')
+    if isinstance(max_mutation_serial, bool) or not isinstance(max_mutation_serial, int):
+        max_mutation_serial = 0
+    metadata['max_mutation_serial'] = max(max_mutation_serial, mutation_serial)
     totals = metadata.get('mutation_totals')
     if not isinstance(totals, dict):
         totals = {}

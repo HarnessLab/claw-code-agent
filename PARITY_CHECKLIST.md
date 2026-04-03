@@ -28,6 +28,7 @@ Done:
 - [x] Mutable tool transcript updates during tool execution
 - [x] Transcript mutation history for replaced/tombstoned messages
 - [x] Assistant streaming and tool-call transcript mutation history
+- [x] Session-wide mutation serial tracking across transcript updates
 - [x] Structured transcript block export for messages, tool calls, and tool results
 - [x] Resume-time file-history replay reminders
 - [x] Resume-time file-history snapshot previews for file edits
@@ -39,32 +40,42 @@ Done:
 - [x] Reactive compaction retry after prompt-too-long backend failures
 - [x] Reasoning-token budget enforcement
 - [x] Tool-call and delegated-task budget enforcement
+- [x] Resume-aware cumulative model-call budgets
+- [x] Resume-aware cumulative session usage/cost persistence
 - [x] Basic nested-agent delegation tool
 - [x] Sequential multi-subtask delegation with parent-context carryover
+- [x] Dependency-aware delegated subtasks
+- [x] Topological dependency-batch delegation planning
 - [x] Basic agent-manager lineage tracking for nested agents
 - [x] Managed agent-group membership tracking with child indices
+- [x] Agent-manager strategy and batch summary tracking for delegated groups
 - [x] Delegated child-session resume by saved session id
 - [x] Agent-manager tracking for resumed child-session lineage
 - [x] Plugin-cache discovery and prompt-context injection
 - [x] Manifest-based plugin runtime discovery
 - [x] Manifest-defined plugin hooks for before-prompt and after-turn runtime injection
+- [x] Manifest-defined plugin lifecycle hooks for resume, persist, and delegate phases
 - [x] Manifest-defined plugin tool aliases over base runtime tools
 - [x] Manifest-defined executable virtual tools
 - [x] Manifest-defined plugin tool blocking
 - [x] Manifest-defined plugin `beforeTool` guidance
 - [x] Manifest-defined plugin tool-result guidance injected back into the transcript
+- [x] Plugin runtime session-state persistence and resume restoration
 - [x] Compaction metadata with compacted message ids
 - [x] Compaction metadata with preserved-tail ids and compaction depth
 - [x] Compaction metadata with compacted/preserved lineage ids and revision summaries
+- [x] Compaction metadata with source mutation serials and mutation totals
 - [x] Snipped-message metadata with source role/kind lineage
 - [x] Snipped-message metadata with source lineage id and revision
 - [x] Resume-time compaction / snipping replay reminder
+- [x] Resume-time compaction replay of source mutation summaries
 - [x] Query-engine facade that can drive the real Python runtime agent
 - [x] Query-engine runtime event counters and transcript-kind summaries
 - [x] Query-engine runtime mutation counters
 - [x] Query-engine stream-level runtime summary event
 - [x] Query-engine transcript-store compaction summaries
 - [x] Delegate-group and delegated-subtask runtime events
+- [x] Delegate-batch runtime events and summaries
 - [x] Query-engine runtime orchestration summaries for group status and child stop reasons
 - [x] Query-engine runtime context-reduction summaries
 - [x] Query-engine runtime lineage summaries
@@ -73,12 +84,12 @@ Done:
 Missing:
 
 - [ ] Full partial tool-result streaming parity across the complete upstream/npm tool surface
-- [ ] Full rich transcript mutation behavior like the npm runtime
-- [ ] Full reasoning budgets and task budgets parity
-- [ ] Full multi-agent orchestration parity beyond sequential grouped delegation and resumed-child flows
-- [ ] Full file history snapshots and replay flows beyond the current preview/id-based implementation
-- [ ] Full executable plugin lifecycle beyond manifest-driven guidance, blocking, aliases, and virtual tools
-- [ ] Full session compaction / snipping parity beyond lineage-aware summaries and replay reminders
+- [ ] Full rich transcript mutation behavior like the npm runtime beyond the current lineage, counters, block export, and mutation-serial tracking
+- [ ] Full reasoning budgets and task budgets parity beyond the current cumulative model/tool/delegation/session-call enforcement
+- [ ] Full multi-agent orchestration parity beyond dependency-aware batched delegation, resumed-child flows, and current agent-manager summaries
+- [ ] Full file history snapshots and replay flows beyond the current preview/id-based implementation and delegated-batch replay metadata
+- [ ] Full executable plugin lifecycle beyond manifest-driven prompt/tool/session hooks, blocking, aliases, virtual tools, and persisted runtime state
+- [ ] Full session compaction / snipping parity beyond lineage-aware summaries, mutation-serial compaction metadata, and replay reminders
 - [ ] Full `QueryEngine.ts` parity
 
 ## 2. CLI Entrypoints And Runtime Modes
@@ -87,6 +98,7 @@ Done:
 
 - [x] Python CLI entrypoint
 - [x] `agent` command
+- [x] `agent-chat` command
 - [x] `agent-resume` command
 - [x] `agent-prompt` command
 - [x] `agent-context` command
@@ -292,11 +304,12 @@ Missing:
 Done:
 
 - [x] Non-interactive CLI execution
+- [x] Basic interactive REPL-style agent chat loop
 - [x] Transcript printing for debugging
 
 Missing:
 
-- [ ] Interactive REPL parity
+- [ ] Interactive REPL parity beyond the current basic `agent-chat` loop
 - [ ] Ink/TUI component parity
 - [ ] Screen system parity
 - [ ] Keyboard interaction parity

@@ -53,6 +53,7 @@ class QueryEnginePort:
     transcript_store: TranscriptStore = field(default_factory=TranscriptStore)
     runtime_agent: LocalCodingAgent | None = None
     plugin_runtime: PluginRuntime | None = None
+    runtime_cumulative_usage: UsageSummary = field(default_factory=UsageSummary)
     runtime_event_counts: dict[str, int] = field(default_factory=dict)
     runtime_message_kind_counts: dict[str, int] = field(default_factory=dict)
     runtime_mutation_counts: dict[str, int] = field(default_factory=dict)
@@ -84,6 +85,7 @@ class QueryEnginePort:
             session_id=stored.session_id,
             mutable_messages=list(stored.messages),
             total_usage=UsageSummary(stored.input_tokens, stored.output_tokens),
+            runtime_cumulative_usage=UsageSummary(stored.input_tokens, stored.output_tokens),
             transcript_store=transcript,
             plugin_runtime=PluginRuntime.from_workspace(Path.cwd()),
         )
@@ -115,16 +117,34 @@ class QueryEnginePort:
     ) -> TurnResult:
         if self.config.use_runtime_agent and self.runtime_agent is not None:
             result = self._submit_runtime_message(prompt)
+            cumulative_usage = UsageSummary(
+                input_tokens=result.usage.input_tokens,
+                output_tokens=result.usage.output_tokens,
+            )
+            usage = cumulative_usage
+            if self.runtime_cumulative_usage.input_tokens or self.runtime_cumulative_usage.output_tokens:
+                usage = UsageSummary(
+                    input_tokens=max(
+                        cumulative_usage.input_tokens - self.runtime_cumulative_usage.input_tokens,
+                        0,
+                    ),
+                    output_tokens=max(
+                        cumulative_usage.output_tokens - self.runtime_cumulative_usage.output_tokens,
+                        0,
+                    ),
+                )
+            else:
+                usage = UsageSummary(
+                    input_tokens=cumulative_usage.input_tokens,
+                    output_tokens=cumulative_usage.output_tokens,
+                )
             turn = TurnResult(
                 prompt=prompt,
                 output=result.final_output,
                 matched_commands=matched_commands,
                 matched_tools=matched_tools,
                 permission_denials=denied_tools,
-                usage=UsageSummary(
-                    input_tokens=result.usage.input_tokens,
-                    output_tokens=result.usage.output_tokens,
-                ),
+                usage=usage,
                 stop_reason=result.stop_reason or 'completed',
                 session_id=result.session_id,
                 session_path=result.session_path,
@@ -133,7 +153,12 @@ class QueryEnginePort:
                 events=result.events,
                 transcript=result.transcript,
             )
-            self._record_turn(prompt, turn, denied_tools)
+            self._record_turn(
+                prompt,
+                turn,
+                denied_tools,
+                runtime_cumulative_usage=cumulative_usage,
+            )
             return turn
 
         if len(self.mutable_messages) >= self.config.max_turns:
@@ -345,6 +370,7 @@ class QueryEnginePort:
         prompt: str,
         turn: TurnResult,
         denied_tools: tuple[PermissionDenial, ...],
+        runtime_cumulative_usage: UsageSummary | None = None,
     ) -> None:
         self.mutable_messages.append(prompt)
         self.transcript_store.append(prompt, kind='prompt')
@@ -352,7 +378,11 @@ class QueryEnginePort:
         if self.config.use_runtime_agent:
             self._record_runtime_turn(turn)
         self.permission_denials.extend(denied_tools)
-        self.total_usage = turn.usage
+        if runtime_cumulative_usage is not None:
+            self.runtime_cumulative_usage = runtime_cumulative_usage
+            self.total_usage = runtime_cumulative_usage
+        else:
+            self.total_usage = turn.usage
         self.last_turn = turn
         if turn.session_id is not None:
             self.session_id = turn.session_id
@@ -537,6 +567,16 @@ class QueryEnginePort:
                     self.runtime_context_reduction.get('preserved_tail_messages', 0)
                     + preserved_tail_count
                 )
+            max_source_mutation_serial = metadata.get('max_source_mutation_serial')
+            if (
+                isinstance(max_source_mutation_serial, int)
+                and not isinstance(max_source_mutation_serial, bool)
+            ):
+                current = self.runtime_context_reduction.get('max_source_mutation_serial', 0)
+                self.runtime_context_reduction['max_source_mutation_serial'] = max(
+                    current,
+                    max_source_mutation_serial,
+                )
             compacted_lineage_ids = metadata.get('compacted_lineage_ids')
             if isinstance(compacted_lineage_ids, list):
                 self.runtime_context_reduction['compacted_lineages'] = (
@@ -572,6 +612,16 @@ class QueryEnginePort:
             if isinstance(revision_count, int) and not isinstance(revision_count, bool):
                 current = self.runtime_lineage_stats.get('max_revision_count', 0)
                 self.runtime_lineage_stats['max_revision_count'] = max(current, revision_count)
+            max_mutation_serial = metadata.get('max_mutation_serial')
+            if (
+                isinstance(max_mutation_serial, int)
+                and not isinstance(max_mutation_serial, bool)
+            ):
+                current = self.runtime_lineage_stats.get('max_mutation_serial', 0)
+                self.runtime_lineage_stats['max_mutation_serial'] = max(
+                    current,
+                    max_mutation_serial,
+                )
 
         kind = metadata.get('kind')
         if kind == 'snipped_message':

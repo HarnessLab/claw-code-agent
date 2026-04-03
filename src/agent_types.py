@@ -80,6 +80,8 @@ class BudgetConfig:
     max_total_cost_usd: float | None = None
     max_tool_calls: int | None = None
     max_delegated_tasks: int | None = None
+    max_model_calls: int | None = None
+    max_session_turns: int | None = None
 
 
 @dataclass(frozen=True)

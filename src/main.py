@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 from dataclasses import replace
 import json
+from typing import Callable
 
 from .agent_runtime import LocalCodingAgent
 from .agent_types import (
@@ -63,6 +64,8 @@ def _add_agent_common_args(parser: argparse.ArgumentParser, *, include_backend: 
     parser.add_argument('--max-budget-usd', type=float)
     parser.add_argument('--max-tool-calls', type=int)
     parser.add_argument('--max-delegated-tasks', type=int)
+    parser.add_argument('--max-model-calls', type=int)
+    parser.add_argument('--max-session-turns', type=int)
     parser.add_argument('--response-schema-file')
     parser.add_argument('--response-schema-name')
     parser.add_argument('--response-schema-strict', action='store_true')
@@ -95,6 +98,8 @@ def _build_runtime_config(args: argparse.Namespace) -> AgentRuntimeConfig:
             max_total_cost_usd=getattr(args, 'max_budget_usd', None),
             max_tool_calls=getattr(args, 'max_tool_calls', None),
             max_delegated_tasks=getattr(args, 'max_delegated_tasks', None),
+            max_model_calls=getattr(args, 'max_model_calls', None),
+            max_session_turns=getattr(args, 'max_session_turns', None),
         ),
         output_schema=_load_output_schema_config(args),
         session_directory=(Path('.port_sessions') / 'agent').resolve(),
@@ -175,6 +180,8 @@ def _add_agent_resume_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument('--max-budget-usd', type=float)
     parser.add_argument('--max-tool-calls', type=int)
     parser.add_argument('--max-delegated-tasks', type=int)
+    parser.add_argument('--max-model-calls', type=int)
+    parser.add_argument('--max-session-turns', type=int)
     parser.add_argument('--response-schema-file')
     parser.add_argument('--response-schema-name')
     parser.add_argument('--response-schema-strict', action='store_true')
@@ -258,6 +265,8 @@ def _build_resumed_agent(args: argparse.Namespace) -> tuple[LocalCodingAgent, St
         or args.max_budget_usd is not None
         or args.max_tool_calls is not None
         or args.max_delegated_tasks is not None
+        or args.max_model_calls is not None
+        or args.max_session_turns is not None
     ):
         runtime_config = replace(
             runtime_config,
@@ -296,6 +305,16 @@ def _build_resumed_agent(args: argparse.Namespace) -> tuple[LocalCodingAgent, St
                     args.max_delegated_tasks
                     if args.max_delegated_tasks is not None
                     else runtime_config.budget_config.max_delegated_tasks
+                ),
+                max_model_calls=(
+                    args.max_model_calls
+                    if args.max_model_calls is not None
+                    else runtime_config.budget_config.max_model_calls
+                ),
+                max_session_turns=(
+                    args.max_session_turns
+                    if args.max_session_turns is not None
+                    else runtime_config.budget_config.max_session_turns
                 ),
             ),
         )
@@ -337,6 +356,57 @@ def _print_agent_result(result, *, show_transcript: bool) -> None:
             role = message.get('role', 'unknown')
             print(f'[{role}]')
             print(message.get('content', ''))
+
+
+def _run_agent_chat_loop(
+    agent: LocalCodingAgent,
+    *,
+    initial_prompt: str | None,
+    resume_session_id: str | None,
+    show_transcript: bool,
+    input_func: Callable[[str], str] = input,
+    output_func: Callable[[str], None] = print,
+    result_printer: Callable[..., None] = _print_agent_result,
+) -> int:
+    active_session_id = resume_session_id
+    first_prompt = initial_prompt
+
+    output_func('# Agent Chat')
+    output_func("Enter a prompt. Use '/exit' or '/quit' to stop.")
+    if active_session_id:
+        output_func(f'resuming_session_id={active_session_id}')
+
+    while True:
+        if first_prompt is not None:
+            prompt = first_prompt
+            first_prompt = None
+        else:
+            try:
+                prompt = input_func('user> ')
+            except EOFError:
+                output_func('chat_ended=eof')
+                return 0
+            except KeyboardInterrupt:
+                output_func('\nchat_ended=interrupt')
+                return 130
+
+        normalized = prompt.strip()
+        if not normalized:
+            continue
+        if normalized in {'/exit', '/quit'}:
+            output_func('chat_ended=user_exit')
+            return 0
+
+        if active_session_id:
+            stored_session = load_agent_session(
+                active_session_id,
+                directory=agent.runtime_config.session_directory,
+            )
+            result = agent.resume(prompt, stored_session)
+        else:
+            result = agent.run(prompt)
+        result_printer(result, show_transcript=show_transcript)
+        active_session_id = result.session_id
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -416,6 +486,13 @@ def build_parser() -> argparse.ArgumentParser:
     agent_parser.add_argument('--max-turns', type=int, default=12)
     agent_parser.add_argument('--show-transcript', action='store_true')
     _add_agent_common_args(agent_parser, include_backend=True)
+
+    chat_parser = subparsers.add_parser('agent-chat', help='run an interactive Python local-model chat loop')
+    chat_parser.add_argument('prompt', nargs='?')
+    chat_parser.add_argument('--resume-session-id')
+    chat_parser.add_argument('--max-turns', type=int, default=12)
+    chat_parser.add_argument('--show-transcript', action='store_true')
+    _add_agent_common_args(chat_parser, include_backend=True)
 
     resume_parser = subparsers.add_parser('agent-resume', help='resume a saved Python local-model agent session')
     _add_agent_resume_args(resume_parser)
@@ -563,6 +640,14 @@ def main(argv: list[str] | None = None) -> int:
         result = agent.run(args.prompt)
         _print_agent_result(result, show_transcript=args.show_transcript)
         return 0
+    if args.command == 'agent-chat':
+        agent = _build_agent(args)
+        return _run_agent_chat_loop(
+            agent,
+            initial_prompt=args.prompt,
+            resume_session_id=args.resume_session_id,
+            show_transcript=args.show_transcript,
+        )
     if args.command == 'agent-resume':
         agent, stored_session = _build_resumed_agent(args)
         result = agent.resume(args.prompt, stored_session)

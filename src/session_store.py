@@ -64,6 +64,8 @@ class StoredAgentSession:
     usage: JSONDict
     total_cost_usd: float
     file_history: tuple[JSONDict, ...]
+    budget_state: JSONDict
+    plugin_state: JSONDict
     scratchpad_directory: str | None = None
 
 
@@ -94,6 +96,16 @@ def load_agent_session(session_id: str, directory: Path | None = None) -> Stored
         total_cost_usd=float(data.get('total_cost_usd', 0.0)),
         file_history=tuple(
             entry for entry in data.get('file_history', []) if isinstance(entry, dict)
+        ),
+        budget_state=(
+            dict(data.get('budget_state', {}))
+            if isinstance(data.get('budget_state'), dict)
+            else {}
+        ),
+        plugin_state=(
+            dict(data.get('plugin_state', {}))
+            if isinstance(data.get('plugin_state'), dict)
+            else {}
         ),
         scratchpad_directory=(
             str(data['scratchpad_directory'])
@@ -155,6 +167,8 @@ def serialize_runtime_config(runtime_config: AgentRuntimeConfig) -> JSONDict:
             'max_total_cost_usd': runtime_config.budget_config.max_total_cost_usd,
             'max_tool_calls': runtime_config.budget_config.max_tool_calls,
             'max_delegated_tasks': runtime_config.budget_config.max_delegated_tasks,
+            'max_model_calls': runtime_config.budget_config.max_model_calls,
+            'max_session_turns': runtime_config.budget_config.max_session_turns,
         },
         'output_schema': (
             {
@@ -205,6 +219,8 @@ def deserialize_runtime_config(payload: JSONDict) -> AgentRuntimeConfig:
             max_total_cost_usd=_optional_float(budget_payload.get('max_total_cost_usd')),
             max_tool_calls=_optional_int(budget_payload.get('max_tool_calls')),
             max_delegated_tasks=_optional_int(budget_payload.get('max_delegated_tasks')),
+            max_model_calls=_optional_int(budget_payload.get('max_model_calls')),
+            max_session_turns=_optional_int(budget_payload.get('max_session_turns')),
         ),
         output_schema=_deserialize_output_schema(output_schema_payload),
         session_directory=Path(str(payload.get('session_directory', DEFAULT_AGENT_SESSION_DIR))).resolve(),
