@@ -5,7 +5,7 @@
 <h1 align="center">Claw Code Agent</h1>
 
 <p align="center">
-  <em>A Python reimplementation of the Claude Code agent architecture — local models, full control.</em>
+  <em>A Python reimplementation of the Claude Code agent architecture — local models, full control, zero dependencies.</em>
 </p>
 
 <p align="center">
@@ -13,9 +13,35 @@
   <a href="https://github.com/HarnessLab/claw-code-agent"><img src="https://img.shields.io/badge/repo-HarnessLab%2Fclaw--code--agent-181717?logo=github" alt="GitHub"></a>
   <a href="https://docs.vllm.ai/"><img src="https://img.shields.io/badge/backend-vLLM-FF6F00?logo=lightning&logoColor=white" alt="vLLM"></a>
   <a href="https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct"><img src="https://img.shields.io/badge/model-Qwen3--Coder-FFD21E?logo=huggingface&logoColor=black" alt="Qwen3-Coder"></a>
+  <img src="https://img.shields.io/badge/dependencies-zero-brightgreen" alt="Zero Dependencies">
   <img src="https://img.shields.io/badge/status-alpha-orange" alt="Alpha">
   <img src="https://img.shields.io/badge/license-open--source-green" alt="License">
 </p>
+
+---
+
+## 📢 What's New
+
+> **April 2026 — Major Update**
+
+| | Feature | Details |
+|---|---------|---------|
+| 🆕 | **Interactive Chat Mode** | New `agent-chat` command — multi-turn REPL with `/exit` to quit |
+| 🆕 | **Streaming Output** | Token-by-token streaming with `--stream` flag |
+| 🆕 | **Plugin Runtime** | Full manifest-based plugin system — hooks, tool aliases, virtual tools, tool blocking |
+| 🆕 | **Nested Agent Delegation** | Delegate subtasks to child agents with dependency-aware topological batching |
+| 🆕 | **Agent Manager** | Lineage tracking, group membership, batch summaries for nested agents |
+| 🆕 | **Cost Tracking & Budgets** | Token budgets, cost budgets, tool-call limits, model-call limits, session-turn limits |
+| 🆕 | **Structured Output** | JSON schema response mode with `--response-schema-file` |
+| 🆕 | **Context Compaction** | Auto-snip, auto-compact, and reactive compaction on prompt-too-long errors |
+| 🆕 | **File History Replay** | Journaling of file edits with snapshot IDs, replay summaries on session resume |
+| 🆕 | **Truncation Continuation** | Automatic continuation when model response is cut off (`finish_reason=length`) |
+| 🆕 | **Ollama Support** | Works out of the box with Ollama's OpenAI-compatible API |
+| 🆕 | **LiteLLM Proxy Support** | Route through LiteLLM Proxy to any provider |
+| 🆕 | **OpenRouter Support** | Cloud API gateway — access OpenAI, Anthropic, Google models via one endpoint |
+| 🆕 | **Query Engine** | Runtime event counters, transcript summaries, orchestration reports |
+| 🆕 | **Testing Guide** | Comprehensive [TESTING_GUIDE.md](TESTING_GUIDE.md) with commands for every feature |
+| 🆕 | **Parity Checklist** | Full [PARITY_CHECKLIST.md](PARITY_CHECKLIST.md) tracking implementation status vs npm source |
 
 ---
 
@@ -26,6 +52,8 @@ This repository reimplements the [Claude Code](https://docs.anthropic.com/en/doc
 Built on the public porting workspace from [instructkr/claw-code](https://github.com/instructkr/claw-code), the active development lives at [HarnessLab/claw-code-agent](https://github.com/HarnessLab/claw-code-agent).
 
 > **Goal:** Not to ship the original npm source, but to reimplement the full agent flow in Python — prompt assembly, context building, slash commands, tool calling, session persistence, and local model execution.
+>
+> **Zero external dependencies** — just Python's standard library.
 
 <p align="center">
   <img src="images/demo_2.gif" alt="Claw Code Agent demo" width="900" />
@@ -38,48 +66,73 @@ Built on the public porting workspace from [instructkr/claw-code](https://github
 | Feature | Description |
 |---------|-------------|
 | 🤖 **Agent Loop** | Full agentic coding loop with tool calling and iterative reasoning |
+| 💬 **Interactive Chat** | Multi-turn REPL via `agent-chat` with session continuity |
 | 🧰 **Core Tools** | File read / write / edit, glob search, grep search, shell execution |
+| 🔌 **Plugin Runtime** | Manifest-based plugins with hooks, aliases, virtual tools, and tool blocking |
+| 🪆 **Nested Delegation** | Delegate subtasks to child agents with dependency-aware topological batching |
+| 📡 **Streaming** | Token-by-token streaming output with `--stream` |
 | 💬 **Slash Commands** | Local commands: `/help`, `/context`, `/tools`, `/memory`, `/status`, `/model`, and more |
-| 🧠 **Context Engine** | Automatic context building with CLAUDE.md discovery and usage reporting |
-| 🔄 **Session Persistence** | Save and resume agent sessions across runs |
+| 🧠 **Context Engine** | Automatic context building with CLAUDE.md discovery, compaction, and snipping |
+| 🔄 **Session Persistence** | Save and resume agent sessions with file-history replay |
+| 💰 **Cost & Budget Control** | Token budgets, cost limits, tool-call caps, model-call caps |
+| 📋 **Structured Output** | JSON schema response mode for programmatic use |
 | 🔐 **Permission System** | Granular control: `--allow-write`, `--allow-shell`, `--unsafe` |
-| 🏗️ **OpenAI-Compatible Runtime** | Python client targets an OpenAI-compatible API, with `vLLM` as the documented setup |
+| 🏗️ **OpenAI-Compatible** | Works with vLLM, Ollama, LiteLLM Proxy, OpenRouter — any OpenAI-compatible API |
 | 🐉 **Qwen3-Coder** | First-class support for `Qwen3-Coder-30B-A3B-Instruct` via vLLM |
+| 📦 **Zero Dependencies** | Pure Python standard library — nothing to install |
 
 ---
 
 ## 📋 Roadmap
 
-### Testing
+### 📚 Documentation
 
-- See [TESTING_GUIDE.md](TESTING_GUIDE.md) for concrete commands to verify the current implementation feature by feature.
+| Document | Description |
+|----------|-------------|
+| [TESTING_GUIDE.md](TESTING_GUIDE.md) | Step-by-step commands to verify every feature |
+| [PARITY_CHECKLIST.md](PARITY_CHECKLIST.md) | Full implementation status vs the npm source |
 
-### Done
+### ✅ Done
 
 - [x] Python CLI agent loop
+- [x] Interactive chat mode (`agent-chat`) with multi-turn REPL
 - [x] OpenAI-compatible local model backend
 - [x] Qwen3-Coder support through vLLM with `qwen3_xml` tool parser
+- [x] Ollama, LiteLLM Proxy, and OpenRouter backends
 - [x] Core tools: `list_dir`, `read_file`, `write_file`, `edit_file`, `glob_search`, `grep_search`, `bash`
 - [x] Context building and `/context`-style usage reporting
 - [x] Slash commands: `/help`, `/context`, `/context-raw`, `/prompt`, `/permissions`, `/model`, `/tools`, `/memory`, `/status`, `/clear`
 - [x] Session persistence and `agent-resume` flow
 - [x] Permission system (read-only, write, shell, unsafe tiers)
+- [x] Streaming token-by-token assistant output
+- [x] Truncated-response continuation flow
+- [x] Auto-snip and auto-compact context reduction
+- [x] Reactive compaction retry on prompt-too-long errors
+- [x] Cost tracking and usage budget enforcement
+- [x] Token, tool-call, model-call, and session-turn budgets
+- [x] Structured output / JSON schema response mode
+- [x] File history journaling with snapshot IDs and replay summaries
+- [x] Nested agent delegation with dependency-aware topological batching
+- [x] Agent manager with lineage tracking and group membership
+- [x] Plugin runtime: manifest discovery, hooks, aliases, virtual tools, tool blocking
+- [x] Plugin lifecycle hooks: resume, persist, delegate phases
+- [x] Plugin session-state persistence and resume restoration
+- [x] Query engine facade driving the real Python runtime
+- [x] Compaction metadata with lineage IDs and revision summaries
 - [x] Unit tests for the Python runtime
 - [x] `pyproject.toml` packaging with `setuptools`
 
-### In Progress
+### 🔲 In Progress
 
-- [ ] Full MCP support
-- [ ] Full plugin system
-- [ ] Full slash-command parity
+- [ ] Full MCP server support
+- [ ] Full slash-command parity with npm runtime
 - [ ] Full interactive REPL / TUI behavior
-- [ ] Exact tokenizer / context accounting
-- [ ] Hooks parity
-- [ ] Remote modes parity
-- [ ] Voice / VIM parity
-- [ ] Some deeper runtime details from the npm source
-- [ ] Cost tracking and budget limits
-
+- [ ] Exact tokenizer-accurate context accounting
+- [ ] Hooks system parity
+- [ ] Remote runtime modes (SSH, teleport, deep-link)
+- [ ] Voice and VIM modes
+- [ ] Editor and platform integrations
+- [ ] Background and team features
 
 ---
 
@@ -88,11 +141,13 @@ Built on the public porting workspace from [instructkr/claw-code](https://github
 ```text
 claw-code/
 ├── README.md
+├── TESTING_GUIDE.md              # How to test every feature
+├── PARITY_CHECKLIST.md           # Implementation status vs npm source
 ├── pyproject.toml
 ├── .gitignore
 ├── images/
 │   └── logo.png
-├── src/                          # Python implementation
+├── src/                          # Python implementation (75+ modules)
 │   ├── main.py                   # CLI entry point & argument parsing
 │   ├── agent_runtime.py          # Core agent loop (LocalCodingAgent)
 │   ├── agent_tools.py            # Tool definitions & execution engine
@@ -101,14 +156,19 @@ claw-code/
 │   ├── agent_context_usage.py    # Context usage estimation & reporting
 │   ├── agent_session.py          # Session state management
 │   ├── agent_slash_commands.py   # Local slash command processing
+│   ├── agent_manager.py          # Nested agent lineage & group tracking
 │   ├── agent_types.py            # Shared dataclasses & type definitions
-│   ├── openai_compat.py          # OpenAI-compatible API client
+│   ├── openai_compat.py          # OpenAI-compatible API client (streaming)
+│   ├── plugin_runtime.py         # Plugin manifest, hooks, aliases, virtual tools
+│   ├── agent_plugin_cache.py     # Plugin discovery & prompt injection cache
 │   ├── session_store.py          # Session serialization & persistence
+│   ├── transcript.py             # Transcript block export & mutation tracking
+│   ├── query_engine.py           # Query engine facade & runtime orchestration
 │   ├── permissions.py            # Tool permission filtering
+│   ├── cost_tracker.py           # Cost & budget enforcement
 │   ├── tools.py                  # Mirrored tool inventory
 │   ├── commands.py               # Mirrored command inventory
-│   ├── ...                       # 75+ modules across 30+ packages
-│   ├── plugins/                  # Plugin subsystem (WIP)
+│   ├── plugins/                  # Plugin subsystem
 │   ├── hooks/                    # Hook system (WIP)
 │   ├── remote/                   # Remote runtime modes (WIP)
 │   ├── voice/                    # Voice mode (WIP)
@@ -119,6 +179,8 @@ claw-code/
     ├── test_agent_context_usage.py
     ├── test_agent_prompting.py
     ├── test_agent_slash_commands.py
+    ├── test_main.py
+    ├── test_query_engine_runtime.py
     └── test_porting_workspace.py
 ```
 
@@ -129,6 +191,7 @@ claw-code/
 | Requirement | Details |
 |-------------|---------|
 | 🐍 Python | `3.10` or higher |
+| 📚 Dependencies | **None** — pure Python standard library |
 | 🖥️ Model Server | `vLLM`, `Ollama`, `LiteLLM Proxy`, or `OpenRouter`, with tool calling support |
 | 🧠 Model | [`Qwen/Qwen3-Coder-30B-A3B-Instruct`](https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct) (recommended) |
 
@@ -285,6 +348,14 @@ python3 -m src.main agent \
 python3 -m src.main agent \
   "Run pwd and ls src, then summarize the result." \
   --cwd . --allow-shell
+
+# Interactive chat mode
+python3 -m src.main agent-chat --cwd .
+
+# Streaming output
+python3 -m src.main agent \
+  "Explain the current architecture." \
+  --cwd . --stream
 ```
 
 ---
@@ -296,6 +367,7 @@ python3 -m src.main agent \
 | Command | Description |
 |---------|-------------|
 | `agent <prompt>` | Run the agent with a prompt |
+| `agent-chat [prompt]` | Start interactive multi-turn chat mode |
 | `agent-prompt` | Show the assembled system prompt |
 | `agent-context` | Show estimated context usage |
 | `agent-context-raw` | Show the raw context snapshot |
@@ -311,10 +383,44 @@ python3 -m src.main agent \
 | `--allow-write` | Allow the agent to modify files |
 | `--allow-shell` | Allow the agent to execute shell commands |
 | `--unsafe` | Allow destructive shell operations |
+| `--stream` | Enable token-by-token streaming output |
 | `--show-transcript` | Print the full message transcript |
 | `--system-prompt <text>` | Set a custom system prompt |
 | `--append-system-prompt <text>` | Append to the system prompt |
 | `--add-dir <path>` | Add extra directories to context |
+
+### Budget & Limit Flags
+
+| Flag | Description |
+|------|-------------|
+| `--max-total-tokens <n>` | Total token budget |
+| `--max-input-tokens <n>` | Input token budget |
+| `--max-output-tokens <n>` | Output token budget |
+| `--max-reasoning-tokens <n>` | Reasoning token budget |
+| `--max-budget-usd <n>` | Maximum cost in USD |
+| `--max-tool-calls <n>` | Maximum tool calls per run |
+| `--max-delegated-tasks <n>` | Maximum delegated subtasks |
+| `--max-model-calls <n>` | Maximum model API calls |
+| `--max-session-turns <n>` | Maximum session turns |
+| `--input-cost-per-million <n>` | Input token pricing |
+| `--output-cost-per-million <n>` | Output token pricing |
+
+### Context Control Flags
+
+| Flag | Description |
+|------|-------------|
+| `--auto-snip-threshold <n>` | Auto-snip older messages at this token count |
+| `--auto-compact-threshold <n>` | Auto-compact at this token count |
+| `--compact-preserve-messages <n>` | Messages to preserve during compaction |
+| `--disable-claude-md` | Disable CLAUDE.md discovery |
+
+### Structured Output Flags
+
+| Flag | Description |
+|------|-------------|
+| `--response-schema-file <path>` | JSON schema file for structured output |
+| `--response-schema-name <name>` | Schema name identifier |
+| `--response-schema-strict` | Enforce strict schema validation |
 
 ### Slash Commands
 
@@ -351,7 +457,6 @@ python3 -m src.main tools --limit 10    # Tool inventory
 
 ---
 
-
 ## 🔧 Built-in Tools
 
 The agent has access to 7 core tools:
@@ -365,6 +470,54 @@ The agent has access to 7 core tools:
 | `glob_search` | Find files by glob pattern | 🟢 Always |
 | `grep_search` | Search file contents by regex | 🟢 Always |
 | `bash` | Execute shell commands | 🔴 `--allow-shell` |
+
+---
+
+## 🔌 Plugin System
+
+Claw Code Agent supports a **manifest-based plugin runtime**. Drop a `plugin.json` in a `plugins/` subdirectory:
+
+```json
+{
+  "name": "my-plugin",
+  "hooks": {
+    "beforePrompt": "Inject guidance into the system prompt.",
+    "afterTurn": "Run after each agent turn.",
+    "onResume": "Reapply state on session resume.",
+    "beforePersist": "Save state before session is saved.",
+    "beforeDelegate": "Inject guidance before child agents.",
+    "afterDelegate": "Process child agent results."
+  },
+  "toolAliases": [
+    { "name": "my_read", "baseTool": "read_file", "description": "Custom read alias." }
+  ],
+  "virtualTools": [
+    { "name": "my_tool", "description": "A virtual tool.", "responseTemplate": "result: {input}" }
+  ]
+}
+```
+
+> See [TESTING_GUIDE.md](TESTING_GUIDE.md) **Section 13** for full plugin testing commands.
+
+---
+
+## 🪆 Nested Agent Delegation
+
+The agent can delegate subtasks to child agents with full context carryover:
+
+```bash
+python3 -m src.main agent \
+  "Delegate a subtask to inspect src/agent_runtime.py and return a summary." \
+  --cwd . --show-transcript
+```
+
+Features:
+- Sequential and parallel subtask execution
+- Dependency-aware topological batching
+- Child-session save and resume
+- Agent manager lineage tracking
+
+> See [TESTING_GUIDE.md](TESTING_GUIDE.md) **Section 12** for delegation testing commands.
 
 ---
 
@@ -383,6 +536,14 @@ Resume a previous session:
 python3 -m src.main agent-resume \
   4f2c8c6f9c0e4d7c9c7b1b2a3d4e5f67 \
   "Continue the previous task and finish the missing parts."
+```
+
+Resume directly into interactive chat:
+
+```bash
+python3 -m src.main agent-chat \
+  --resume-session-id <session-id> \
+  --cwd .
 ```
 
 Inspect saved sessions:
@@ -413,6 +574,8 @@ python3 -m src.main agent \
   --cwd .
 ```
 
+> 📚 **Full testing guide:** See [TESTING_GUIDE.md](TESTING_GUIDE.md) for step-by-step commands covering all 16 feature areas.
+
 ---
 
 ## 🔐 Permission Model
@@ -426,27 +589,13 @@ Claw Code Agent uses a **tiered permission system** to keep the agent safe by de
 | **Shell** | + shell command execution | `--allow-shell` |
 | **Unsafe** | + destructive shell operations | `--unsafe` |
 
-## 🔎 Detailed Parity Status Against npm `src`
+---
 
-The full implementation checklist now lives in [PARITY_CHECKLIST.md](PARITY_CHECKLIST.md).
+## 🔎 Parity Status
 
-It breaks parity down by:
+The full implementation checklist tracking parity against the npm `src` lives in [PARITY_CHECKLIST.md](PARITY_CHECKLIST.md).
 
-- core agent runtime
-- CLI/runtime modes
-- prompt assembly
-- context and memory
-- slash commands
-- built-in tools
-- commands and task systems
-- permissions, hooks, and policy
-- MCP, plugins, and skills
-- interactive REPL / TUI
-- remote, background, and team features
-- editor, platform, and native integrations
-- services and internal subsystems
-- mirrored workspace versus working runtime
-- high-priority next steps
+It covers: core runtime, CLI modes, prompt assembly, context/memory, slash commands, tools, permissions, plugins, MCP, REPL/TUI, remote features, editor integrations, and internal subsystems.
 
 ---
 
@@ -459,5 +608,5 @@ It breaks parity down by:
 ---
 
 <p align="center">
-  <sub>Built with 🐍 Python · Powered by 🐉  HarnessLab Team.</sub>
+  <sub>Built with 🐍 Python · Powered by 🐉 HarnessLab Team.</sub>
 </p>
