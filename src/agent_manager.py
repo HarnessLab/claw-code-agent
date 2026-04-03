@@ -26,9 +26,13 @@ class ManagedAgentGroup:
     label: str | None = None
     parent_agent_id: str | None = None
     child_agent_ids: tuple[str, ...] = ()
+    strategy: str = 'serial'
     status: str = 'running'
     completed_children: int = 0
     failed_children: int = 0
+    batch_count: int = 0
+    max_batch_size: int = 0
+    dependency_skips: int = 0
 
 
 @dataclass
@@ -68,6 +72,7 @@ class AgentManager:
         *,
         label: str | None = None,
         parent_agent_id: str | None = None,
+        strategy: str = 'serial',
     ) -> str:
         self._group_counter += 1
         group_id = f'group_{self._group_counter}'
@@ -75,6 +80,7 @@ class AgentManager:
             group_id=group_id,
             label=label,
             parent_agent_id=parent_agent_id,
+            strategy=strategy,
         )
         return group_id
 
@@ -97,9 +103,13 @@ class AgentManager:
                 label=group.label,
                 parent_agent_id=group.parent_agent_id,
                 child_agent_ids=updated_children,
+                strategy=group.strategy,
                 status=group.status,
                 completed_children=group.completed_children,
                 failed_children=group.failed_children,
+                batch_count=group.batch_count,
+                max_batch_size=group.max_batch_size,
+                dependency_skips=group.dependency_skips,
             )
         record = self.records.get(agent_id)
         if record is None:
@@ -129,6 +139,9 @@ class AgentManager:
         status: str,
         completed_children: int,
         failed_children: int,
+        batch_count: int = 0,
+        max_batch_size: int = 0,
+        dependency_skips: int = 0,
     ) -> None:
         group = self.groups.get(group_id)
         if group is None:
@@ -138,9 +151,13 @@ class AgentManager:
             label=group.label,
             parent_agent_id=group.parent_agent_id,
             child_agent_ids=group.child_agent_ids,
+            strategy=group.strategy,
             status=status,
             completed_children=completed_children,
             failed_children=failed_children,
+            batch_count=batch_count,
+            max_batch_size=max_batch_size,
+            dependency_skips=dependency_skips,
         )
 
     def finish_agent(
@@ -209,11 +226,15 @@ class AgentManager:
         return {
             'group_id': group.group_id,
             'label': group.label,
+            'strategy': group.strategy,
             'status': group.status,
             'child_count': len(children),
             'completed_children': group.completed_children,
             'failed_children': group.failed_children,
             'resumed_children': resumed_children,
+            'batch_count': group.batch_count,
+            'max_batch_size': group.max_batch_size,
+            'dependency_skips': group.dependency_skips,
             'stop_reason_counts': stop_reason_counts,
         }
 
@@ -266,7 +287,9 @@ class AgentManager:
             lines.append(
                 f'- {label}: group_status={group.status} children={len(group.child_agent_ids)} '
                 f'completed={group.completed_children} failed={group.failed_children} '
-                f"resumed={summary['resumed_children']}{stop_suffix}"
+                f"resumed={summary['resumed_children']} strategy={group.strategy} "
+                f"batches={group.batch_count} max_batch_size={group.max_batch_size} "
+                f"dependency_skips={group.dependency_skips}{stop_suffix}"
             )
         if len(self.groups) > 6:
             lines.append(f'- ... plus {len(self.groups) - 6} more agent groups')

@@ -50,6 +50,10 @@ Built on the public porting workspace from [instructkr/claw-code](https://github
 
 ## 📋 Roadmap
 
+### Testing
+
+- See [TESTING_GUIDE.md](TESTING_GUIDE.md) for concrete commands to verify the current implementation feature by feature.
+
 ### Done
 
 - [x] Python CLI agent loop

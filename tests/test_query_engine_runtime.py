@@ -903,6 +903,7 @@ class QueryEngineRuntimeTests(unittest.TestCase):
         self.assertIn('## Runtime Context Reduction', summary)
         self.assertIn('- compact_boundaries=1', summary)
         self.assertIn('- compacted_lineages=', summary)
+        self.assertIn('- max_source_mutation_serial=', summary)
         self.assertIn('## Runtime Lineage', summary)
         self.assertIn('- seen_lineages=', summary)
         self.assertIn('- compacted_lineages=', summary)
@@ -1148,3 +1149,190 @@ class QueryEngineRuntimeTests(unittest.TestCase):
         self.assertEqual(turn.output, 'Parent completed after resumed child.')
         self.assertIn('## Runtime Orchestration', summary)
         self.assertIn('- resumed_children=1', summary)
+
+    def test_query_engine_runtime_summary_tracks_topological_delegate_batches(self) -> None:
+        responses = [
+            {
+                'choices': [
+                    {
+                        'message': {
+                            'role': 'assistant',
+                            'content': 'Delegating batched subtasks.',
+                            'tool_calls': [
+                                {
+                                    'id': 'call_1',
+                                    'type': 'function',
+                                    'function': {
+                                        'name': 'delegate_agent',
+                                        'arguments': json.dumps(
+                                            {
+                                                'subtasks': [
+                                                    {
+                                                        'label': 'summarize',
+                                                        'prompt': 'Summarize the project.',
+                                                        'depends_on': ['scan'],
+                                                    },
+                                                    {
+                                                        'label': 'scan',
+                                                        'prompt': 'Scan the project.',
+                                                    },
+                                                ],
+                                                'strategy': 'topological',
+                                                'max_turns': 2,
+                                            }
+                                        ),
+                                    },
+                                }
+                            ],
+                        },
+                        'finish_reason': 'tool_calls',
+                    }
+                ],
+                'usage': {'prompt_tokens': 8, 'completion_tokens': 3},
+            },
+            {
+                'choices': [
+                    {
+                        'message': {
+                            'role': 'assistant',
+                            'content': 'Child scan result.',
+                        },
+                        'finish_reason': 'stop',
+                    }
+                ],
+                'usage': {'prompt_tokens': 5, 'completion_tokens': 2},
+            },
+            {
+                'choices': [
+                    {
+                        'message': {
+                            'role': 'assistant',
+                            'content': 'Child summary result.',
+                        },
+                        'finish_reason': 'stop',
+                    }
+                ],
+                'usage': {'prompt_tokens': 5, 'completion_tokens': 2},
+            },
+            {
+                'choices': [
+                    {
+                        'message': {
+                            'role': 'assistant',
+                            'content': 'Parent completed after topological delegation.',
+                        },
+                        'finish_reason': 'stop',
+                    }
+                ],
+                'usage': {'prompt_tokens': 7, 'completion_tokens': 2},
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            with patch(
+                'src.openai_compat.request.urlopen',
+                side_effect=make_urlopen_side_effect(responses),
+            ):
+                agent = LocalCodingAgent(
+                    model_config=ModelConfig(
+                        model='Qwen/Qwen3-Coder-30B-A3B-Instruct',
+                        base_url='http://127.0.0.1:8000/v1',
+                    ),
+                    runtime_config=AgentRuntimeConfig(cwd=workspace),
+                )
+                engine = QueryEnginePort.from_runtime_agent(agent)
+                turn = engine.submit_message('Use topological delegated subtasks')
+                summary = engine.render_summary()
+
+        self.assertEqual(turn.output, 'Parent completed after topological delegation.')
+        self.assertIn('## Runtime Events', summary)
+        self.assertIn('- delegate_batch_result=2', summary)
+        self.assertIn('## Agent Manager', summary)
+        self.assertIn('strategy=topological', summary)
+        self.assertIn('batches=2', summary)
+
+    def test_query_engine_runtime_summary_tracks_dependency_skips(self) -> None:
+        responses = [
+            {
+                'choices': [
+                    {
+                        'message': {
+                            'role': 'assistant',
+                            'content': 'Delegating dependency-aware subtasks.',
+                            'tool_calls': [
+                                {
+                                    'id': 'call_1',
+                                    'type': 'function',
+                                    'function': {
+                                        'name': 'delegate_agent',
+                                        'arguments': json.dumps(
+                                            {
+                                                'subtasks': [
+                                                    {
+                                                        'label': 'summarize',
+                                                        'prompt': 'Summarize the project.',
+                                                        'depends_on': ['scan'],
+                                                    },
+                                                    {
+                                                        'label': 'scan',
+                                                        'prompt': 'Scan the project.',
+                                                    },
+                                                ],
+                                                'max_turns': 2,
+                                            }
+                                        ),
+                                    },
+                                }
+                            ],
+                        },
+                        'finish_reason': 'tool_calls',
+                    }
+                ],
+                'usage': {'prompt_tokens': 8, 'completion_tokens': 3},
+            },
+            {
+                'choices': [
+                    {
+                        'message': {
+                            'role': 'assistant',
+                            'content': 'Child scan result.',
+                        },
+                        'finish_reason': 'stop',
+                    }
+                ],
+                'usage': {'prompt_tokens': 5, 'completion_tokens': 2},
+            },
+            {
+                'choices': [
+                    {
+                        'message': {
+                            'role': 'assistant',
+                            'content': 'Parent completed after dependency-aware delegation.',
+                        },
+                        'finish_reason': 'stop',
+                    }
+                ],
+                'usage': {'prompt_tokens': 7, 'completion_tokens': 2},
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            with patch(
+                'src.openai_compat.request.urlopen',
+                side_effect=make_urlopen_side_effect(responses),
+            ):
+                agent = LocalCodingAgent(
+                    model_config=ModelConfig(
+                        model='Qwen/Qwen3-Coder-30B-A3B-Instruct',
+                        base_url='http://127.0.0.1:8000/v1',
+                    ),
+                    runtime_config=AgentRuntimeConfig(cwd=workspace),
+                )
+                engine = QueryEnginePort.from_runtime_agent(agent)
+                turn = engine.submit_message('Use dependency-aware delegated subtasks')
+                summary = engine.render_summary()
+
+        self.assertEqual(turn.output, 'Parent completed after dependency-aware delegation.')
+        self.assertIn('## Runtime Orchestration', summary)
+        self.assertIn('- child_stop:pending_dependency=1', summary)
+        self.assertIn('- child_stop:stop=1', summary)

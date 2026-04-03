@@ -44,11 +44,16 @@ class PluginManifest:
     blocked_tools: tuple[str, ...] = ()
     before_prompt: str | None = None
     after_turn: str | None = None
+    on_resume: str | None = None
+    before_persist: str | None = None
+    before_delegate: str | None = None
+    after_delegate: str | None = None
 
 
 @dataclass
 class PluginRuntime:
     manifests: tuple[PluginManifest, ...] = field(default_factory=tuple)
+    session_state: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_workspace(
@@ -94,17 +99,82 @@ class PluginRuntime:
         return tuple(blocks)
 
     def before_prompt_injections(self) -> tuple[str, ...]:
-        return tuple(
+        if not self.manifests:
+            return ()
+        injections = tuple(
             manifest.before_prompt
             for manifest in self.manifests
             if manifest.before_prompt
         )
+        if injections:
+            self.session_state['before_prompt_calls'] = int(
+                self.session_state.get('before_prompt_calls', 0)
+            ) + 1
+        return injections
 
     def after_turn_injections(self) -> tuple[str, ...]:
-        return tuple(
+        if not self.manifests:
+            return ()
+        injections = tuple(
             manifest.after_turn
             for manifest in self.manifests
             if manifest.after_turn
+        )
+        if injections:
+            self.session_state['after_turn_calls'] = int(
+                self.session_state.get('after_turn_calls', 0)
+            ) + 1
+        return injections
+
+    def on_resume_injections(self) -> tuple[str, ...]:
+        if not self.manifests:
+            return ()
+        injections = tuple(
+            manifest.on_resume
+            for manifest in self.manifests
+            if manifest.on_resume
+        )
+        if injections:
+            self.session_state['resume_calls'] = int(
+                self.session_state.get('resume_calls', 0)
+            ) + 1
+        return injections
+
+    def before_persist_injections(self) -> tuple[str, ...]:
+        if not self.manifests:
+            return ()
+        injections = tuple(
+            manifest.before_persist
+            for manifest in self.manifests
+            if manifest.before_persist
+        )
+        if injections:
+            self.session_state['persist_calls'] = int(
+                self.session_state.get('persist_calls', 0)
+            ) + 1
+        return injections
+
+    def before_delegate_injections(self) -> tuple[str, ...]:
+        if not self.manifests:
+            return ()
+        injections = tuple(
+            manifest.before_delegate
+            for manifest in self.manifests
+            if manifest.before_delegate
+        )
+        if injections:
+            self.session_state['delegate_calls'] = int(
+                self.session_state.get('delegate_calls', 0)
+            ) + 1
+        return injections
+
+    def after_delegate_injections(self) -> tuple[str, ...]:
+        if not self.manifests:
+            return ()
+        return tuple(
+            manifest.after_delegate
+            for manifest in self.manifests
+            if manifest.after_delegate
         )
 
     def register_tool_aliases(
@@ -198,6 +268,111 @@ class PluginRuntime:
             lines.append(f"- {'; '.join(details)}")
         if len(self.manifests) > 10:
             lines.append(f'- ... plus {len(self.manifests) - 10} more plugin manifests')
+        if self.session_state:
+            lines.append(
+                '- runtime_state='
+                + ', '.join(
+                    f'{name}={value}'
+                    for name, value in sorted(self.session_state.items())
+                    if isinstance(value, (int, float, str, bool))
+                )
+            )
+        return '\n'.join(lines)
+
+    def record_tool_attempt(self, tool_name: str, *, blocked: bool) -> None:
+        attempts = int(self.session_state.get('tool_attempts', 0))
+        self.session_state['tool_attempts'] = attempts + 1
+        if blocked:
+            blocked_count = int(self.session_state.get('blocked_tool_attempts', 0))
+            self.session_state['blocked_tool_attempts'] = blocked_count + 1
+        counts = self.session_state.get('tool_attempt_counts')
+        if not isinstance(counts, dict):
+            counts = {}
+        counts[tool_name] = int(counts.get(tool_name, 0)) + 1
+        self.session_state['tool_attempt_counts'] = counts
+
+    def record_tool_result(
+        self,
+        tool_name: str,
+        *,
+        ok: bool,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        counts = self.session_state.get('tool_result_counts')
+        if not isinstance(counts, dict):
+            counts = {}
+        counts[tool_name] = int(counts.get(tool_name, 0)) + 1
+        self.session_state['tool_result_counts'] = counts
+        key = 'successful_tool_results' if ok else 'failed_tool_results'
+        self.session_state[key] = int(self.session_state.get(key, 0)) + 1
+        if isinstance(metadata, dict) and metadata.get('action') == 'plugin_virtual_tool':
+            self.session_state['virtual_tool_results'] = int(
+                self.session_state.get('virtual_tool_results', 0)
+            ) + 1
+
+    def export_session_state(self) -> dict[str, Any]:
+        exported: dict[str, Any] = {}
+        for key, value in self.session_state.items():
+            if isinstance(value, dict):
+                exported[key] = {
+                    str(name): count
+                    for name, count in value.items()
+                    if isinstance(name, str)
+                    and isinstance(count, int)
+                    and not isinstance(count, bool)
+                }
+            elif isinstance(value, (int, float, str, bool)):
+                exported[key] = value
+        return exported
+
+    def restore_session_state(self, payload: dict[str, Any] | None) -> None:
+        if not isinstance(payload, dict):
+            self.session_state = {}
+            return
+        restored: dict[str, Any] = {}
+        for key, value in payload.items():
+            if isinstance(value, dict):
+                restored[key] = {
+                    str(name): int(count)
+                    for name, count in value.items()
+                    if isinstance(name, str)
+                    and isinstance(count, int)
+                    and not isinstance(count, bool)
+                }
+            elif isinstance(value, (int, float, str, bool)):
+                restored[key] = value
+        self.session_state = restored
+
+    def runtime_state_reminder(self) -> str | None:
+        if not self.manifests or not self.session_state:
+            return None
+        lines = ['Plugin runtime state:']
+        before_prompt_calls = self.session_state.get('before_prompt_calls')
+        if isinstance(before_prompt_calls, int):
+            lines.append(f'- before_prompt_calls={before_prompt_calls}')
+        after_turn_calls = self.session_state.get('after_turn_calls')
+        if isinstance(after_turn_calls, int):
+            lines.append(f'- after_turn_calls={after_turn_calls}')
+        tool_attempts = self.session_state.get('tool_attempts')
+        if isinstance(tool_attempts, int):
+            lines.append(f'- tool_attempts={tool_attempts}')
+        blocked_attempts = self.session_state.get('blocked_tool_attempts')
+        if isinstance(blocked_attempts, int):
+            lines.append(f'- blocked_tool_attempts={blocked_attempts}')
+        resume_calls = self.session_state.get('resume_calls')
+        if isinstance(resume_calls, int):
+            lines.append(f'- resume_calls={resume_calls}')
+        persist_calls = self.session_state.get('persist_calls')
+        if isinstance(persist_calls, int):
+            lines.append(f'- persist_calls={persist_calls}')
+        delegate_calls = self.session_state.get('delegate_calls')
+        if isinstance(delegate_calls, int):
+            lines.append(f'- delegate_calls={delegate_calls}')
+        virtual_results = self.session_state.get('virtual_tool_results')
+        if isinstance(virtual_results, int):
+            lines.append(f'- virtual_tool_results={virtual_results}')
+        if len(lines) == 1:
+            return None
         return '\n'.join(lines)
 
 
@@ -248,7 +423,15 @@ def _load_manifest(path: Path) -> PluginManifest | None:
     name = payload.get('name')
     if not isinstance(name, str) or not name.strip():
         return None
-    before_prompt, after_turn, hook_names = _parse_hooks(payload.get('hooks'))
+    (
+        before_prompt,
+        after_turn,
+        on_resume,
+        before_persist,
+        before_delegate,
+        after_delegate,
+        hook_names,
+    ) = _parse_hooks(payload.get('hooks'))
     return PluginManifest(
         name=name.strip(),
         path=str(path),
@@ -266,6 +449,10 @@ def _load_manifest(path: Path) -> PluginManifest | None:
         ),
         before_prompt=before_prompt,
         after_turn=after_turn,
+        on_resume=on_resume,
+        before_persist=before_persist,
+        before_delegate=before_delegate,
+        after_delegate=after_delegate,
     )
 
 
@@ -311,10 +498,20 @@ def _extract_tool_aliases(payload: dict[str, Any]) -> tuple[PluginToolAlias, ...
     return tuple(aliases)
 
 
-def _parse_hooks(value: Any) -> tuple[str | None, str | None, tuple[str, ...]]:
+def _parse_hooks(
+    value: Any,
+) -> tuple[
+    str | None,
+    str | None,
+    str | None,
+    str | None,
+    str | None,
+    str | None,
+    tuple[str, ...],
+]:
     if isinstance(value, list):
         names = tuple(item for item in value if isinstance(item, str) and item.strip())
-        return None, None, names
+        return None, None, None, None, None, None, names
     if isinstance(value, dict):
         names = tuple(key for key in value if isinstance(key, str) and key.strip())
         before_prompt = value.get('beforePrompt')
@@ -323,12 +520,28 @@ def _parse_hooks(value: Any) -> tuple[str | None, str | None, tuple[str, ...]]:
         after_turn = value.get('afterTurn')
         if after_turn is None:
             after_turn = value.get('after_turn')
+        on_resume = value.get('onResume')
+        if on_resume is None:
+            on_resume = value.get('on_resume')
+        before_persist = value.get('beforePersist')
+        if before_persist is None:
+            before_persist = value.get('before_persist')
+        before_delegate = value.get('beforeDelegate')
+        if before_delegate is None:
+            before_delegate = value.get('before_delegate')
+        after_delegate = value.get('afterDelegate')
+        if after_delegate is None:
+            after_delegate = value.get('after_delegate')
         return (
             _optional_string(before_prompt),
             _optional_string(after_turn),
+            _optional_string(on_resume),
+            _optional_string(before_persist),
+            _optional_string(before_delegate),
+            _optional_string(after_delegate),
             names,
         )
-    return None, None, ()
+    return None, None, None, None, None, None, ()
 
 
 def _extract_tool_hooks(payload: dict[str, Any]) -> tuple[PluginToolHook, ...]:

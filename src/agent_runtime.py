@@ -45,6 +45,7 @@ from .session_store import (
     save_agent_session,
     serialize_model_config,
     serialize_runtime_config,
+    usage_from_payload,
 )
 
 
@@ -106,6 +107,8 @@ class LocalCodingAgent:
         self.active_session_id = None
         self.last_session_path = None
         self.resume_source_session_id = None
+        if self.plugin_runtime is not None:
+            self.plugin_runtime.restore_session_state({})
 
     def build_prompt_context(self, scratchpad_directory: Path | None = None):
         return build_prompt_context(
@@ -144,6 +147,8 @@ class LocalCodingAgent:
     def run(self, prompt: str) -> AgentRunResult:
         self.managed_agent_id = None
         self.resume_source_session_id = None
+        if self.plugin_runtime is not None:
+            self.plugin_runtime.restore_session_state({})
         session_id = uuid4().hex
         scratchpad_directory = self._ensure_scratchpad_directory(session_id)
         result = self._run_prompt(
@@ -175,6 +180,8 @@ class LocalCodingAgent:
         self.last_session_path = str(
             self.runtime_config.session_directory / f'{stored_session.session_id}.json'
         )
+        if self.plugin_runtime is not None:
+            self.plugin_runtime.restore_session_state(stored_session.plugin_state)
         scratchpad_directory = (
             Path(stored_session.scratchpad_directory)
             if stored_session.scratchpad_directory
@@ -214,6 +221,10 @@ class LocalCodingAgent:
             )
 
         effective_prompt = self._apply_plugin_before_prompt_hooks(slash_result.prompt or prompt)
+        effective_prompt = self._apply_plugin_resume_hooks(
+            effective_prompt,
+            resumed=base_session is not None,
+        )
         self.managed_agent_id = self.agent_manager.start_agent(
             prompt=effective_prompt,
             parent_agent_id=self.parent_agent_id,
@@ -234,22 +245,49 @@ class LocalCodingAgent:
         self.last_session = session
         self.active_session_id = session_id
         tool_specs = [tool.to_openai_tool() for tool in self.tool_registry.values()]
-        tool_calls = 0
+        starting_usage = UsageStats()
+        starting_cost_usd = 0.0
+        starting_tool_calls = 0
+        starting_session_turns = 0
+        starting_model_calls = 0
+        if base_session is not None and self.resume_source_session_id:
+            try:
+                stored_resume_state = load_agent_session(
+                    self.resume_source_session_id,
+                    directory=self.runtime_config.session_directory,
+                )
+            except OSError:
+                stored_resume_state = None
+            if stored_resume_state is not None:
+                starting_usage = usage_from_payload(stored_resume_state.usage)
+                starting_cost_usd = stored_resume_state.total_cost_usd
+                starting_tool_calls = stored_resume_state.tool_calls
+                starting_session_turns = stored_resume_state.turns
+                budget_state = (
+                    stored_resume_state.budget_state
+                    if isinstance(stored_resume_state.budget_state, dict)
+                    else {}
+                )
+                starting_model_calls = int(budget_state.get('model_calls', 0)) if isinstance(budget_state.get('model_calls', 0), int) else 0
+        tool_calls = starting_tool_calls
         last_content = ''
-        total_usage = UsageStats()
-        total_cost_usd = 0.0
+        total_usage = starting_usage
+        total_cost_usd = starting_cost_usd
         file_history = list(existing_file_history)
         stream_events: list[dict[str, object]] = []
         assistant_response_segments: list[str] = []
         delegated_tasks = sum(
             1 for entry in file_history if entry.get('action') == 'delegate_agent'
         )
+        model_calls = starting_model_calls
 
         initial_budget = self._check_budget(
             total_usage,
             total_cost_usd,
             tool_calls=tool_calls,
             delegated_tasks=delegated_tasks,
+            model_calls=model_calls,
+            session_turns=starting_session_turns,
         )
         if initial_budget.exceeded:
             result = AgentRunResult(
@@ -302,6 +340,7 @@ class LocalCodingAgent:
                             for _ in [0]
                         )
                         stream_events.extend(event.to_dict() for event in turn_events)
+                        model_calls += 1
                         total_usage = total_usage + turn.usage
                         total_cost_usd = self.model_config.pricing.estimate_cost_usd(total_usage)
                         last_content = turn.content
@@ -311,6 +350,8 @@ class LocalCodingAgent:
                             total_cost_usd,
                             tool_calls=tool_calls,
                             delegated_tasks=delegated_tasks,
+                            model_calls=model_calls,
+                            session_turns=starting_session_turns + turn_index,
                         )
                         if budget_after_model.exceeded:
                             result = AgentRunResult(
@@ -400,6 +441,7 @@ class LocalCodingAgent:
                 return result
 
             stream_events.extend(event.to_dict() for event in turn_events)
+            model_calls += 1
             total_usage = total_usage + turn.usage
             total_cost_usd = self.model_config.pricing.estimate_cost_usd(total_usage)
             last_content = turn.content
@@ -409,6 +451,8 @@ class LocalCodingAgent:
                 total_cost_usd,
                 tool_calls=tool_calls,
                 delegated_tasks=delegated_tasks,
+                model_calls=model_calls,
+                session_turns=starting_session_turns + turn_index,
             )
             if budget_after_model.exceeded:
                 result = AgentRunResult(
@@ -487,6 +531,8 @@ class LocalCodingAgent:
                     total_cost_usd,
                     tool_calls=tool_calls,
                     delegated_tasks=delegated_tasks,
+                    model_calls=model_calls,
+                    session_turns=starting_session_turns + turn_index,
                 )
                 if budget_after_tool_request.exceeded:
                     stream_events.append(
@@ -534,6 +580,8 @@ class LocalCodingAgent:
                         'message_id': session.messages[tool_message_index].message_id,
                     }
                 )
+                if self.plugin_runtime is not None:
+                    self.plugin_runtime.record_tool_attempt(tool_call.name, blocked=False)
                 plugin_preflight_messages = self._plugin_tool_preflight_messages(tool_call.name)
                 if plugin_preflight_messages:
                     stream_events.append(
@@ -547,6 +595,13 @@ class LocalCodingAgent:
                     )
                 plugin_block_message = self._plugin_block_message(tool_call.name)
                 if plugin_block_message is not None:
+                    if self.plugin_runtime is not None:
+                        blocked_attempts = int(
+                            self.plugin_runtime.session_state.get('blocked_tool_attempts', 0)
+                        )
+                        self.plugin_runtime.session_state['blocked_tool_attempts'] = (
+                            blocked_attempts + 1
+                        )
                     tool_result = ToolExecutionResult(
                         name=tool_call.name,
                         ok=False,
@@ -596,6 +651,12 @@ class LocalCodingAgent:
                         tool_result = update.result
                 if tool_result is None:
                     raise RuntimeError(f'Tool executor returned no final result for {tool_call.name}')
+                if self.plugin_runtime is not None:
+                    self.plugin_runtime.record_tool_result(
+                        tool_call.name,
+                        ok=tool_result.ok,
+                        metadata=tool_result.metadata,
+                    )
                 plugin_messages = self._plugin_tool_result_messages(tool_call.name)
                 if plugin_messages:
                     merged_metadata = dict(tool_result.metadata)
@@ -646,6 +707,22 @@ class LocalCodingAgent:
                     preflight_messages=plugin_preflight_messages,
                     block_message=plugin_block_message,
                     plugin_messages=plugin_messages,
+                    delegate_preflight_messages=tuple(
+                        message
+                        for message in tool_result.metadata.get(
+                            'plugin_delegate_preflight_messages',
+                            [],
+                        )
+                        if isinstance(message, str) and message
+                    ),
+                    delegate_after_messages=tuple(
+                        message
+                        for message in tool_result.metadata.get(
+                            'plugin_delegate_after_messages',
+                            [],
+                        )
+                        if isinstance(message, str) and message
+                    ),
                 )
                 if plugin_runtime_message is not None:
                     session.append_user(
@@ -833,6 +910,8 @@ class LocalCodingAgent:
         *,
         tool_calls: int,
         delegated_tasks: int,
+        model_calls: int,
+        session_turns: int,
     ) -> BudgetDecision:
         budget = self.runtime_config.budget_config
         token_reason = self._check_token_budget(usage, budget)
@@ -870,6 +949,28 @@ class LocalCodingAgent:
                 reason=(
                     'Stopped because the delegated-task budget was exceeded '
                     f'({delegated_tasks} > {budget.max_delegated_tasks}).'
+                ),
+            )
+        if (
+            budget.max_model_calls is not None
+            and model_calls > budget.max_model_calls
+        ):
+            return BudgetDecision(
+                exceeded=True,
+                reason=(
+                    'Stopped because the model-call budget was exceeded '
+                    f'({model_calls} > {budget.max_model_calls}).'
+                ),
+            )
+        if (
+            budget.max_session_turns is not None
+            and session_turns > budget.max_session_turns
+        ):
+            return BudgetDecision(
+                exceeded=True,
+                reason=(
+                    'Stopped because the session-turn budget was exceeded '
+                    f'({session_turns} > {budget.max_session_turns}).'
                 ),
             )
         return BudgetDecision(exceeded=False)
@@ -1185,6 +1286,12 @@ class LocalCodingAgent:
             entry['history_kind'] = 'shell'
         elif action == 'delegate_agent':
             entry['history_kind'] = 'delegation'
+            delegate_batches = metadata.get('delegate_batches')
+            if isinstance(delegate_batches, list):
+                entry['delegate_batch_count'] = len(delegate_batches)
+            dependency_skips = metadata.get('dependency_skips')
+            if isinstance(dependency_skips, int) and not isinstance(dependency_skips, bool):
+                entry['dependency_skips'] = dependency_skips
         else:
             entry['history_kind'] = 'tool'
         return entry
@@ -1292,6 +1399,7 @@ class LocalCodingAgent:
         ]
         compaction_depth = (max(prior_depths) if prior_depths else 0) + 1
         compacted_kinds: dict[str, int] = {}
+        source_mutation_totals: dict[str, int] = {}
         compacted_lineage_ids: list[str] = []
         preserved_tail_lineage_ids = [
             lineage_id
@@ -1301,6 +1409,7 @@ class LocalCodingAgent:
             if isinstance(lineage_id, str) and lineage_id
         ]
         max_source_revision = 0
+        max_source_mutation_serial = 0
         compacted_revision_total = 0
         for message in messages:
             kind = message.metadata.get('kind')
@@ -1313,6 +1422,26 @@ class LocalCodingAgent:
             if isinstance(revision, int) and not isinstance(revision, bool):
                 max_source_revision = max(max_source_revision, revision)
                 compacted_revision_total += revision
+            max_mutation_serial = message.metadata.get('max_mutation_serial')
+            if isinstance(max_mutation_serial, int) and not isinstance(max_mutation_serial, bool):
+                max_source_mutation_serial = max(
+                    max_source_mutation_serial,
+                    max_mutation_serial,
+                )
+            mutation_totals = message.metadata.get('mutation_totals')
+            if isinstance(mutation_totals, dict):
+                for mutation_kind, count in mutation_totals.items():
+                    if (
+                        not isinstance(mutation_kind, str)
+                        or not mutation_kind
+                        or isinstance(count, bool)
+                        or not isinstance(count, int)
+                        or count <= 0
+                    ):
+                        continue
+                    source_mutation_totals[mutation_kind] = (
+                        source_mutation_totals.get(mutation_kind, 0) + count
+                    )
 
         compact_boundary_id = f'compact_boundary_{turn_index}_{len(messages)}'
 
@@ -1340,6 +1469,8 @@ class LocalCodingAgent:
                 'compacted_lineage_ids': compacted_lineage_ids,
                 'preserved_tail_lineage_ids': preserved_tail_lineage_ids,
                 'max_source_revision': max_source_revision,
+                'max_source_mutation_serial': max_source_mutation_serial,
+                'source_mutation_totals': source_mutation_totals,
                 'compacted_revision_total': compacted_revision_total,
                 'compacted_message_ids': [
                     message.message_id for message in messages if message.message_id
@@ -1401,121 +1532,245 @@ class LocalCodingAgent:
         }
         include_parent_context = bool(arguments.get('include_parent_context', True))
         continue_on_error = bool(arguments.get('continue_on_error', True))
+        max_failures = arguments.get('max_failures')
+        if isinstance(max_failures, bool) or (max_failures is not None and not isinstance(max_failures, int)):
+            max_failures = None
+        if isinstance(max_failures, int) and max_failures < 0:
+            max_failures = None
+        strategy = self._normalize_delegate_strategy(arguments.get('strategy'))
         child_summaries: list[dict[str, object]] = []
         child_session_ids: list[str] = []
         prior_results: list[dict[str, str]] = []
+        completed_labels: set[str] = set()
+        failed_labels: set[str] = set()
+        delegate_preflight_messages = (
+            self.plugin_runtime.before_delegate_injections()
+            if self.plugin_runtime is not None
+            else ()
+        )
+        delegate_after_messages: tuple[str, ...] = ()
         group_id: str | None = None
         if self.agent_manager is not None and len(subtasks) > 1:
             group_id = self.agent_manager.start_group(
                 label=str(arguments.get('label') or 'delegated_group'),
                 parent_agent_id=self.managed_agent_id,
+                strategy=strategy,
             )
+        planned_batches = self._plan_delegate_batches(subtasks, strategy)
+        batch_summaries: list[dict[str, object]] = []
         failed_children = 0
+        dependency_skips = 0
         child_result = None
-        for index, subtask in enumerate(subtasks, start=1):
-            subtask_label = str(subtask.get('label') or f'subtask_{index}')
-            child_agent = LocalCodingAgent(
-                model_config=self.model_config,
-                runtime_config=replace(
-                    child_runtime_config,
-                    max_turns=subtask.get('max_turns', child_runtime_config.max_turns),
-                ),
-                custom_system_prompt=self.custom_system_prompt,
-                append_system_prompt=self.append_system_prompt,
-                override_system_prompt=self.override_system_prompt,
-                tool_registry=child_tools,
-                agent_manager=self.agent_manager,
-                parent_agent_id=self.managed_agent_id,
-                managed_group_id=group_id,
-                managed_child_index=index,
-                managed_label=subtask_label,
-            )
-            if group_id is not None and child_agent.managed_agent_id is not None:
-                self.agent_manager.register_group_child(
-                    group_id,
-                    child_agent.managed_agent_id,
-                    child_index=index,
+        stop_processing = False
+        for batch_index, batch in enumerate(planned_batches, start=1):
+            if stop_processing:
+                break
+            batch_completed = 0
+            batch_failed = 0
+            batch_skipped = 0
+            batch_labels: list[str] = []
+            for subtask in batch:
+                index = int(subtask.get('_delegate_index', len(child_summaries) + 1))
+                subtask_label = str(subtask.get('label') or f'subtask_{index}')
+                batch_labels.append(subtask_label)
+                dependencies = tuple(
+                    item
+                    for item in subtask.get('depends_on', ())
+                    if isinstance(item, str) and item
                 )
-            child_prompt = str(subtask['prompt'])
-            if include_parent_context and prior_results:
-                child_prompt = self._prepend_delegate_context(child_prompt, prior_results)
-            resume_session_id = subtask.get('resume_session_id')
-            resume_used = False
-            if isinstance(resume_session_id, str) and resume_session_id:
-                try:
-                    stored_child_session = load_agent_session(
-                        resume_session_id,
-                        directory=child_runtime_config.session_directory,
+                unmet_dependencies = [
+                    dependency
+                    for dependency in dependencies
+                    if dependency not in completed_labels
+                ]
+                blocked_dependencies = [
+                    dependency
+                    for dependency in dependencies
+                    if dependency in failed_labels
+                ]
+                if unmet_dependencies:
+                    skip_reason = (
+                        'skipped_dependency'
+                        if blocked_dependencies
+                        else 'pending_dependency'
                     )
-                except OSError:
                     child_result = AgentRunResult(
-                        final_output=f'Unable to load delegated session {resume_session_id}.',
+                        final_output=(
+                            'Skipped delegated subtask because dependencies were not satisfied: '
+                            + ', '.join(unmet_dependencies)
+                        ),
                         turns=0,
                         tool_calls=0,
                         transcript=(),
-                        stop_reason='resume_load_error',
-                        session_id=resume_session_id,
+                        stop_reason=skip_reason,
                     )
-                    failed_children += 1
                     summary = {
                         'index': index,
                         'label': subtask_label,
-                        'session_id': resume_session_id,
+                        'session_id': '',
                         'turns': child_result.turns,
                         'tool_calls': child_result.tool_calls,
-                        'stop_reason': child_result.stop_reason or 'resume_load_error',
+                        'stop_reason': skip_reason,
                         'output_preview': self._preview_text(child_result.final_output, 220),
-                        'resume_used': True,
-                        'resumed_from_session_id': resume_session_id,
+                        'resume_used': False,
+                        'resumed_from_session_id': '',
+                        'depends_on': list(dependencies),
+                        'batch_index': batch_index,
                     }
                     child_summaries.append(summary)
-                    prior_results.append(
-                        {
-                            'label': summary['label'],
-                            'output_preview': str(summary['output_preview']),
-                        }
-                    )
+                    failed_children += 1
+                    batch_failed += 1
+                    batch_skipped += 1
+                    dependency_skips += 1
+                    failed_labels.add(subtask_label)
+                    if isinstance(max_failures, int) and failed_children > max_failures:
+                        stop_processing = True
+                        break
                     if not continue_on_error:
+                        stop_processing = True
                         break
                     continue
-                child_result = child_agent.resume(child_prompt, stored_child_session)
-                resume_used = True
-            else:
-                child_result = child_agent.run(child_prompt)
-            if group_id is not None and child_agent.managed_agent_id is not None:
-                self.agent_manager.register_group_child(
-                    group_id,
-                    child_agent.managed_agent_id,
-                    child_index=index,
+                child_agent = LocalCodingAgent(
+                    model_config=self.model_config,
+                    runtime_config=replace(
+                        child_runtime_config,
+                        max_turns=subtask.get('max_turns', child_runtime_config.max_turns),
+                    ),
+                    custom_system_prompt=self.custom_system_prompt,
+                    append_system_prompt=self.append_system_prompt,
+                    override_system_prompt=self.override_system_prompt,
+                    tool_registry=child_tools,
+                    agent_manager=self.agent_manager,
+                    parent_agent_id=self.managed_agent_id,
+                    managed_group_id=group_id,
+                    managed_child_index=index,
+                    managed_label=subtask_label,
                 )
-            summary = {
-                'index': index,
-                'label': subtask_label,
-                'session_id': child_result.session_id or '',
-                'turns': child_result.turns,
-                'tool_calls': child_result.tool_calls,
-                'stop_reason': child_result.stop_reason or 'stop',
-                'output_preview': self._preview_text(child_result.final_output, 220),
-                'resume_used': resume_used,
-                'resumed_from_session_id': (
-                    str(resume_session_id)
-                    if isinstance(resume_session_id, str) and resume_session_id
-                    else ''
-                ),
-            }
-            child_summaries.append(summary)
-            if child_result.session_id:
-                child_session_ids.append(child_result.session_id)
-            prior_results.append(
+                if group_id is not None and child_agent.managed_agent_id is not None:
+                    self.agent_manager.register_group_child(
+                        group_id,
+                        child_agent.managed_agent_id,
+                        child_index=index,
+                    )
+                child_prompt = str(subtask['prompt'])
+                if delegate_preflight_messages:
+                    child_prompt = self._prepend_plugin_delegate_context(
+                        child_prompt,
+                        delegate_preflight_messages,
+                    )
+                if include_parent_context and prior_results:
+                    child_prompt = self._prepend_delegate_context(child_prompt, prior_results)
+                resume_session_id = subtask.get('resume_session_id')
+                resume_used = False
+                if isinstance(resume_session_id, str) and resume_session_id:
+                    try:
+                        stored_child_session = load_agent_session(
+                            resume_session_id,
+                            directory=child_runtime_config.session_directory,
+                        )
+                    except OSError:
+                        child_result = AgentRunResult(
+                            final_output=f'Unable to load delegated session {resume_session_id}.',
+                            turns=0,
+                            tool_calls=0,
+                            transcript=(),
+                            stop_reason='resume_load_error',
+                            session_id=resume_session_id,
+                        )
+                        failed_children += 1
+                        batch_failed += 1
+                        summary = {
+                            'index': index,
+                            'label': subtask_label,
+                            'session_id': resume_session_id,
+                            'turns': child_result.turns,
+                            'tool_calls': child_result.tool_calls,
+                            'stop_reason': child_result.stop_reason or 'resume_load_error',
+                            'output_preview': self._preview_text(child_result.final_output, 220),
+                            'resume_used': True,
+                            'resumed_from_session_id': resume_session_id,
+                            'depends_on': list(dependencies),
+                            'batch_index': batch_index,
+                        }
+                        child_summaries.append(summary)
+                        prior_results.append(
+                            {
+                                'label': summary['label'],
+                                'output_preview': str(summary['output_preview']),
+                            }
+                        )
+                        failed_labels.add(subtask_label)
+                        if isinstance(max_failures, int) and failed_children > max_failures:
+                            stop_processing = True
+                            break
+                        if not continue_on_error:
+                            stop_processing = True
+                            break
+                        continue
+                    child_result = child_agent.resume(child_prompt, stored_child_session)
+                    resume_used = True
+                else:
+                    child_result = child_agent.run(child_prompt)
+                if group_id is not None and child_agent.managed_agent_id is not None:
+                    self.agent_manager.register_group_child(
+                        group_id,
+                        child_agent.managed_agent_id,
+                        child_index=index,
+                    )
+                summary = {
+                    'index': index,
+                    'label': subtask_label,
+                    'session_id': child_result.session_id or '',
+                    'turns': child_result.turns,
+                    'tool_calls': child_result.tool_calls,
+                    'stop_reason': child_result.stop_reason or 'stop',
+                    'output_preview': self._preview_text(child_result.final_output, 220),
+                    'resume_used': resume_used,
+                    'resumed_from_session_id': (
+                        str(resume_session_id)
+                        if isinstance(resume_session_id, str) and resume_session_id
+                        else ''
+                    ),
+                    'depends_on': list(dependencies),
+                    'batch_index': batch_index,
+                }
+                child_summaries.append(summary)
+                if child_result.session_id:
+                    child_session_ids.append(child_result.session_id)
+                prior_results.append(
+                    {
+                        'label': summary['label'],
+                        'output_preview': str(summary['output_preview']),
+                    }
+                )
+                if child_result.stop_reason in {'backend_error', 'budget_exceeded'}:
+                    failed_children += 1
+                    batch_failed += 1
+                    failed_labels.add(subtask_label)
+                    if isinstance(max_failures, int) and failed_children > max_failures:
+                        stop_processing = True
+                        break
+                    if not continue_on_error:
+                        stop_processing = True
+                        break
+                else:
+                    batch_completed += 1
+                    completed_labels.add(subtask_label)
+            batch_status = 'completed'
+            if batch_failed and batch_completed:
+                batch_status = 'partial'
+            elif batch_failed:
+                batch_status = 'failed'
+            batch_summaries.append(
                 {
-                    'label': summary['label'],
-                    'output_preview': str(summary['output_preview']),
+                    'batch_index': batch_index,
+                    'labels': batch_labels,
+                    'completed_children': batch_completed,
+                    'failed_children': batch_failed,
+                    'skipped_children': batch_skipped,
+                    'status': batch_status,
                 }
             )
-            if child_result.stop_reason in {'backend_error', 'budget_exceeded'}:
-                failed_children += 1
-                if not continue_on_error:
-                    break
         assert child_result is not None
         completed_children = len(child_summaries) - failed_children
         resumed_children = sum(
@@ -1526,12 +1781,20 @@ class LocalCodingAgent:
             group_status = 'partial'
         elif failed_children:
             group_status = 'failed'
+        delegate_after_messages = (
+            self.plugin_runtime.after_delegate_injections()
+            if self.plugin_runtime is not None
+            else ()
+        )
         if group_id is not None and self.agent_manager is not None:
             self.agent_manager.finish_group(
                 group_id,
                 status=group_status,
                 completed_children=completed_children,
                 failed_children=failed_children,
+                batch_count=len(batch_summaries),
+                max_batch_size=max((len(batch['labels']) for batch in batch_summaries), default=0),
+                dependency_skips=dependency_skips,
             )
         summary_lines = [
             (
@@ -1544,21 +1807,43 @@ class LocalCodingAgent:
             summary_lines.append(f'group_id={group_id}')
             summary_lines.append(f'group_status={group_status}')
             summary_lines.append(f'resumed_children={resumed_children}')
+            summary_lines.append(f'strategy={strategy}')
+            summary_lines.append(f'batch_count={len(batch_summaries)}')
+            summary_lines.append(f'dependency_skips={dependency_skips}')
+            summary_lines.append('')
+        if delegate_preflight_messages:
+            summary_lines.append('Plugin delegate preflight:')
+            summary_lines.extend(f'- {message}' for message in delegate_preflight_messages)
+            summary_lines.append('')
+        for batch in batch_summaries:
+            summary_lines.append(
+                f"[batch {batch['batch_index']}] status={batch['status']} "
+                f"labels={','.join(batch['labels']) or '(none)'} "
+                f"completed={batch['completed_children']} failed={batch['failed_children']} "
+                f"skipped={batch['skipped_children']}"
+            )
+        if batch_summaries:
             summary_lines.append('')
         for summary in child_summaries:
             summary_lines.extend(
                 [
                     f"[{summary['label']}]",
+                    f"batch_index={summary['batch_index']}",
                     f"session_id={summary['session_id']}",
                     f"turns={summary['turns']}",
                     f"tool_calls={summary['tool_calls']}",
                     f"stop_reason={summary['stop_reason']}",
                     f"resume_used={summary['resume_used']}",
                     f"resumed_from_session_id={summary['resumed_from_session_id']}",
+                    f"depends_on={','.join(summary.get('depends_on', [])) or '(none)'}",
                     f"output_preview={summary['output_preview']}",
                     '',
                 ]
             )
+        if delegate_after_messages:
+            summary_lines.append('Plugin delegate completion:')
+            summary_lines.extend(f'- {message}' for message in delegate_after_messages)
+            summary_lines.append('')
         summary_lines.append('Final delegated output:')
         summary_lines.append(child_result.final_output)
         return ToolExecutionResult(
@@ -1579,6 +1864,12 @@ class LocalCodingAgent:
                 'failed_children': failed_children,
                 'completed_children': completed_children,
                 'resumed_children': resumed_children,
+                'strategy': strategy,
+                'max_failures': max_failures,
+                'delegate_batches': batch_summaries,
+                'dependency_skips': dependency_skips,
+                'plugin_delegate_preflight_messages': list(delegate_preflight_messages),
+                'plugin_delegate_after_messages': list(delegate_after_messages),
             },
         )
 
@@ -1591,7 +1882,13 @@ class LocalCodingAgent:
         if isinstance(raw_subtasks, list):
             for index, item in enumerate(raw_subtasks, start=1):
                 if isinstance(item, str) and item.strip():
-                    subtasks.append({'prompt': item.strip(), 'label': f'subtask_{index}'})
+                    subtasks.append(
+                        {
+                            'prompt': item.strip(),
+                            'label': f'subtask_{index}',
+                            '_delegate_index': index,
+                        }
+                    )
                     continue
                 if isinstance(item, dict):
                     prompt = item.get('prompt')
@@ -1608,8 +1905,16 @@ class LocalCodingAgent:
                         resume_session_id = item.get('session_id')
                     if isinstance(resume_session_id, str) and resume_session_id.strip():
                         task['resume_session_id'] = resume_session_id.strip()
+                    depends_on = item.get('depends_on')
+                    if isinstance(depends_on, list):
+                        task['depends_on'] = tuple(
+                            dependency.strip()
+                            for dependency in depends_on
+                            if isinstance(dependency, str) and dependency.strip()
+                        )
                     if isinstance(max_turns, int) and not isinstance(max_turns, bool) and max_turns > 0:
                         task['max_turns'] = max_turns
+                    task['_delegate_index'] = index
                     subtasks.append(task)
         prompt = arguments.get('prompt')
         if isinstance(prompt, str) and prompt.strip():
@@ -1620,8 +1925,71 @@ class LocalCodingAgent:
                     resume_session_id = arguments.get('session_id')
                 if isinstance(resume_session_id, str) and resume_session_id.strip():
                     task['resume_session_id'] = resume_session_id.strip()
+                task['_delegate_index'] = 1
                 subtasks.append(task)
-        return subtasks[:8]
+        return [
+            {
+                **task,
+                '_delegate_index': int(task.get('_delegate_index', index)),
+            }
+            for index, task in enumerate(subtasks[:8], start=1)
+        ]
+
+    def _normalize_delegate_strategy(self, strategy: object) -> str:
+        if not isinstance(strategy, str) or not strategy.strip():
+            return 'serial'
+        normalized = strategy.strip().lower().replace('-', '_')
+        if normalized in {'graph', 'topological', 'dependency_graph', 'parallel', 'parallel_batches'}:
+            return 'topological'
+        return 'serial'
+
+    def _plan_delegate_batches(
+        self,
+        subtasks: list[dict[str, object]],
+        strategy: str,
+    ) -> list[list[dict[str, object]]]:
+        if strategy != 'topological':
+            return [subtasks]
+        remaining = list(subtasks)
+        scheduled_labels: set[str] = set()
+        known_labels = {
+            str(task.get('label'))
+            for task in subtasks
+            if isinstance(task.get('label'), str) and str(task.get('label')).strip()
+        }
+        batches: list[list[dict[str, object]]] = []
+        while remaining:
+            ready: list[dict[str, object]] = []
+            blocked: list[dict[str, object]] = []
+            for task in remaining:
+                dependencies = tuple(
+                    item
+                    for item in task.get('depends_on', ())
+                    if isinstance(item, str) and item
+                )
+                if any(dependency not in known_labels for dependency in dependencies):
+                    blocked.append(task)
+                    continue
+                if all(dependency in scheduled_labels for dependency in dependencies):
+                    ready.append(task)
+                else:
+                    blocked.append(task)
+            if not ready:
+                batches.append(blocked)
+                break
+            batches.append(
+                sorted(
+                    ready,
+                    key=lambda task: int(task.get('_delegate_index', 0)),
+                )
+            )
+            scheduled_labels.update(
+                str(task.get('label'))
+                for task in ready
+                if isinstance(task.get('label'), str) and str(task.get('label')).strip()
+            )
+            remaining = blocked
+        return batches
 
     def _delegated_task_units(
         self,
@@ -1659,6 +2027,21 @@ class LocalCodingAgent:
         lines.extend(['</system-reminder>', '', prompt])
         return '\n'.join(lines)
 
+    def _prepend_plugin_delegate_context(
+        self,
+        prompt: str,
+        messages: tuple[str, ...],
+    ) -> str:
+        if not messages:
+            return prompt
+        lines = [
+            '<system-reminder>',
+            'Plugin delegate guidance:',
+        ]
+        lines.extend(f'- {message}' for message in messages)
+        lines.extend(['</system-reminder>', '', prompt])
+        return '\n'.join(lines)
+
     def _append_runtime_tool_followup_events(
         self,
         stream_events: list[dict[str, object]],
@@ -1677,8 +2060,46 @@ class LocalCodingAgent:
                     'virtual_tool': metadata.get('virtual_tool'),
                 }
             )
+        plugin_delegate_preflight = metadata.get('plugin_delegate_preflight_messages')
+        if isinstance(plugin_delegate_preflight, list) and plugin_delegate_preflight:
+            stream_events.append(
+                {
+                    'type': 'plugin_delegate_preflight',
+                    'tool_call_id': tool_call.id,
+                    'tool_name': tool_call.name,
+                    'message_count': len(plugin_delegate_preflight),
+                }
+            )
+        plugin_delegate_after = metadata.get('plugin_delegate_after_messages')
+        if isinstance(plugin_delegate_after, list) and plugin_delegate_after:
+            stream_events.append(
+                {
+                    'type': 'plugin_delegate_after',
+                    'tool_call_id': tool_call.id,
+                    'tool_name': tool_call.name,
+                    'message_count': len(plugin_delegate_after),
+                }
+            )
         if tool_call.name != 'delegate_agent':
             return
+        delegate_batches = metadata.get('delegate_batches')
+        if isinstance(delegate_batches, list):
+            for batch in delegate_batches:
+                if not isinstance(batch, dict):
+                    continue
+                stream_events.append(
+                    {
+                        'type': 'delegate_batch_result',
+                        'tool_call_id': tool_call.id,
+                        'group_id': metadata.get('group_id'),
+                        'batch_index': batch.get('batch_index'),
+                        'status': batch.get('status'),
+                        'labels': batch.get('labels'),
+                        'completed_children': batch.get('completed_children'),
+                        'failed_children': batch.get('failed_children'),
+                        'skipped_children': batch.get('skipped_children'),
+                    }
+                )
         child_results = metadata.get('child_results')
         if isinstance(child_results, list):
             for child in child_results:
@@ -1697,6 +2118,8 @@ class LocalCodingAgent:
                         'turns': child.get('turns'),
                         'resume_used': child.get('resume_used'),
                         'resumed_from_session_id': child.get('resumed_from_session_id'),
+                        'depends_on': child.get('depends_on'),
+                        'batch_index': child.get('batch_index'),
                     }
                 )
         if metadata.get('group_id') is not None:
@@ -1710,6 +2133,10 @@ class LocalCodingAgent:
                     'completed_children': metadata.get('completed_children'),
                     'failed_children': metadata.get('failed_children'),
                     'resumed_children': metadata.get('resumed_children'),
+                    'strategy': metadata.get('strategy'),
+                    'max_failures': metadata.get('max_failures'),
+                    'batch_count': len(delegate_batches) if isinstance(delegate_batches, list) else 0,
+                    'dependency_skips': metadata.get('dependency_skips'),
                 }
             )
 
@@ -1819,6 +2246,12 @@ class LocalCodingAgent:
             child_session_ids = entry.get('child_session_ids')
             if isinstance(child_session_ids, list) and child_session_ids:
                 details.append(f'child_sessions={len(child_session_ids)}')
+            delegate_batch_count = entry.get('delegate_batch_count')
+            if isinstance(delegate_batch_count, int) and not isinstance(delegate_batch_count, bool):
+                details.append(f'batches={delegate_batch_count}')
+            dependency_skips = entry.get('dependency_skips')
+            if isinstance(dependency_skips, int) and not isinstance(dependency_skips, bool):
+                details.append(f'dependency_skips={dependency_skips}')
             lines.append(f"- {'; '.join(details)}")
             before_snapshot_id = entry.get('before_snapshot_id')
             if isinstance(before_snapshot_id, str) and before_snapshot_id:
@@ -1898,6 +2331,28 @@ class LocalCodingAgent:
             compacted_lineages = latest_boundary.metadata.get('compacted_lineage_ids')
             if isinstance(compacted_lineages, list) and compacted_lineages:
                 lines.append(f'- Latest compacted lineages: {len(compacted_lineages)}')
+            max_source_mutation_serial = latest_boundary.metadata.get('max_source_mutation_serial')
+            if (
+                isinstance(max_source_mutation_serial, int)
+                and not isinstance(max_source_mutation_serial, bool)
+                and max_source_mutation_serial > 0
+            ):
+                lines.append(
+                    f'- Latest source mutation serial: {max_source_mutation_serial}'
+                )
+            source_mutation_totals = latest_boundary.metadata.get('source_mutation_totals')
+            if isinstance(source_mutation_totals, dict) and source_mutation_totals:
+                rendered = ', '.join(
+                    f'{name}:{count}'
+                    for name, count in sorted(source_mutation_totals.items())
+                    if isinstance(name, str)
+                    and name
+                    and isinstance(count, int)
+                    and not isinstance(count, bool)
+                    and count > 0
+                )
+                if rendered:
+                    lines.append(f'- Latest compacted mutations: {rendered}')
             preserved_tail = latest_boundary.metadata.get('preserved_tail_ids')
             if isinstance(preserved_tail, list) and preserved_tail:
                 lines.append(
@@ -1933,8 +2388,16 @@ class LocalCodingAgent:
         preflight_messages: tuple[str, ...],
         block_message: str | None,
         plugin_messages: tuple[str, ...],
+        delegate_preflight_messages: tuple[str, ...] = (),
+        delegate_after_messages: tuple[str, ...] = (),
     ) -> str | None:
-        if block_message is None and not plugin_messages and not preflight_messages:
+        if (
+            block_message is None
+            and not plugin_messages
+            and not preflight_messages
+            and not delegate_preflight_messages
+            and not delegate_after_messages
+        ):
             return None
         lines = [
             '<system-reminder>',
@@ -1942,10 +2405,14 @@ class LocalCodingAgent:
         ]
         for message in preflight_messages:
             lines.append(f'- Before tool: {message}')
+        for message in delegate_preflight_messages:
+            lines.append(f'- Before delegate: {message}')
         if block_message is not None:
             lines.append(f'- Blocked: {block_message}')
         for message in plugin_messages:
             lines.append(f'- After result: {message}')
+        for message in delegate_after_messages:
+            lines.append(f'- After delegate: {message}')
         lines.extend(
             [
                 '',
@@ -1977,6 +2444,51 @@ class LocalCodingAgent:
     ) -> AgentRunResult:
         if result.session_id is None:
             return result
+        persist_events = list(result.events)
+        if self.plugin_runtime is not None:
+            persist_messages = self.plugin_runtime.before_persist_injections()
+            if persist_messages:
+                session.append_user(
+                    self._render_plugin_persist_message(persist_messages),
+                    metadata={
+                        'kind': 'plugin_persist',
+                        'message_count': len(persist_messages),
+                    },
+                    message_id=f'plugin_persist_{result.session_id}',
+                )
+                persist_events.append(
+                    {
+                        'type': 'plugin_before_persist',
+                        'session_id': result.session_id,
+                        'message_count': len(persist_messages),
+                    }
+                )
+        previous_turns = 0
+        previous_tool_calls = 0
+        previous_budget_state: dict[str, object] = {}
+        existing_path = self.runtime_config.session_directory / f'{result.session_id}.json'
+        if existing_path.exists():
+            try:
+                previous = load_agent_session(
+                    result.session_id,
+                    directory=self.runtime_config.session_directory,
+                )
+            except OSError:
+                previous = None
+            if previous is not None:
+                previous_turns = previous.turns
+                previous_tool_calls = previous.tool_calls
+                if isinstance(previous.budget_state, dict):
+                    previous_budget_state = dict(previous.budget_state)
+        budget_state = {
+            'model_calls': int(previous_budget_state.get('model_calls', 0))
+            + max(result.turns, 0),
+            'session_turns': previous_turns + result.turns,
+            'tool_calls': previous_tool_calls + result.tool_calls,
+            'delegated_tasks': sum(
+                1 for entry in result.file_history if entry.get('action') == 'delegate_agent'
+            ),
+        }
         stored = StoredAgentSession(
             session_id=result.session_id,
             model_config=serialize_model_config(self.model_config),
@@ -1985,11 +2497,17 @@ class LocalCodingAgent:
             user_context=dict(session.user_context),
             system_context=dict(session.system_context),
             messages=session.transcript(),
-            turns=result.turns,
-            tool_calls=result.tool_calls,
+            turns=previous_turns + result.turns,
+            tool_calls=previous_tool_calls + result.tool_calls,
             usage=result.usage.to_dict(),
             total_cost_usd=result.total_cost_usd,
             file_history=result.file_history,
+            budget_state=budget_state,
+            plugin_state=(
+                self.plugin_runtime.export_session_state()
+                if self.plugin_runtime is not None
+                else {}
+            ),
             scratchpad_directory=result.scratchpad_directory,
         )
         path = save_agent_session(
@@ -1997,7 +2515,12 @@ class LocalCodingAgent:
             directory=self.runtime_config.session_directory,
         )
         self.last_session_path = str(path)
-        return replace(result, session_path=self.last_session_path)
+        return replace(
+            result,
+            session_path=self.last_session_path,
+            events=tuple(persist_events),
+            transcript=session.transcript(),
+        )
 
     def render_system_prompt(self) -> str:
         prompt_context = self.build_prompt_context()
@@ -2101,11 +2624,45 @@ class LocalCodingAgent:
         if self.plugin_runtime is None:
             return prompt
         injections = self.plugin_runtime.before_prompt_injections()
-        if not injections:
+        state_reminder = self.plugin_runtime.runtime_state_reminder()
+        if not injections and not state_reminder:
             return prompt
         lines = ['<system-reminder>', 'Plugin before-prompt hooks:']
         lines.extend(f'- {entry}' for entry in injections)
+        if state_reminder:
+            lines.extend(['', state_reminder])
         lines.extend(['</system-reminder>', '', prompt])
+        return '\n'.join(lines)
+
+    def _apply_plugin_resume_hooks(
+        self,
+        prompt: str,
+        *,
+        resumed: bool,
+    ) -> str:
+        if not resumed or self.plugin_runtime is None:
+            return prompt
+        injections = self.plugin_runtime.on_resume_injections()
+        if not injections:
+            return prompt
+        lines = ['<system-reminder>', 'Plugin resume hooks:']
+        lines.extend(f'- {entry}' for entry in injections)
+        lines.extend(['</system-reminder>', '', prompt])
+        return '\n'.join(lines)
+
+    def _render_plugin_persist_message(
+        self,
+        messages: tuple[str, ...],
+    ) -> str:
+        lines = ['<system-reminder>', 'Plugin persist hooks:']
+        lines.extend(f'- {entry}' for entry in messages)
+        lines.extend(
+            [
+                '',
+                'This session state was persisted with plugin lifecycle guidance.',
+                '</system-reminder>',
+            ]
+        )
         return '\n'.join(lines)
 
     def _append_plugin_after_turn_events(

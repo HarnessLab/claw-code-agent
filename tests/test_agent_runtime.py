@@ -1872,6 +1872,457 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertIn('delegated-task budget', result.final_output)
         self.assertFalse(any(message.get('role') == 'tool' for message in result.transcript))
 
+    def test_agent_enforces_cumulative_model_call_budget_across_resume(self) -> None:
+        responses = [
+            {
+                'choices': [
+                    {
+                        'message': {
+                            'role': 'assistant',
+                            'content': 'First answer.',
+                        },
+                        'finish_reason': 'stop',
+                    }
+                ],
+                'usage': {'prompt_tokens': 4, 'completion_tokens': 2},
+            },
+            {
+                'choices': [
+                    {
+                        'message': {
+                            'role': 'assistant',
+                            'content': 'Second answer should exceed the model-call budget.',
+                        },
+                        'finish_reason': 'stop',
+                    }
+                ],
+                'usage': {'prompt_tokens': 4, 'completion_tokens': 2},
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            session_dir = workspace / '.port_sessions' / 'agent'
+            with patch('src.openai_compat.request.urlopen', side_effect=make_urlopen_side_effect(responses)):
+                agent = LocalCodingAgent(
+                    model_config=ModelConfig(
+                        model='Qwen/Qwen3-Coder-30B-A3B-Instruct',
+                        base_url='http://127.0.0.1:8000/v1',
+                    ),
+                    runtime_config=AgentRuntimeConfig(
+                        cwd=workspace,
+                        session_directory=session_dir,
+                        budget_config=BudgetConfig(max_model_calls=1),
+                    ),
+                )
+                first = agent.run('First prompt')
+                stored = load_agent_session(first.session_id or '', directory=session_dir)
+                resumed = LocalCodingAgent(
+                    model_config=ModelConfig(
+                        model='Qwen/Qwen3-Coder-30B-A3B-Instruct',
+                        base_url='http://127.0.0.1:8000/v1',
+                    ),
+                    runtime_config=AgentRuntimeConfig(
+                        cwd=workspace,
+                        session_directory=session_dir,
+                        budget_config=BudgetConfig(max_model_calls=1),
+                    ),
+                )
+                second = resumed.resume('Second prompt', stored)
+        self.assertEqual(first.stop_reason, 'stop')
+        self.assertEqual(second.stop_reason, 'budget_exceeded')
+        self.assertIn('model-call budget', second.final_output)
+
+    def test_plugin_runtime_state_is_restored_on_resume(self) -> None:
+        responses = [
+            {
+                'choices': [
+                    {
+                        'message': {
+                            'role': 'assistant',
+                            'content': 'Calling the virtual plugin tool.',
+                            'tool_calls': [
+                                {
+                                    'id': 'call_1',
+                                    'type': 'function',
+                                    'function': {
+                                        'name': 'demo_virtual',
+                                        'arguments': '{"topic": "state"}',
+                                    },
+                                }
+                            ],
+                        },
+                        'finish_reason': 'tool_calls',
+                    }
+                ],
+                'usage': {'prompt_tokens': 8, 'completion_tokens': 3},
+            },
+            {
+                'choices': [
+                    {
+                        'message': {
+                            'role': 'assistant',
+                            'content': 'Initial plugin state stored.',
+                        },
+                        'finish_reason': 'stop',
+                    }
+                ],
+                'usage': {'prompt_tokens': 5, 'completion_tokens': 2},
+            },
+            {
+                'choices': [
+                    {
+                        'message': {
+                            'role': 'assistant',
+                            'content': 'Resume consumed plugin runtime state.',
+                        },
+                        'finish_reason': 'stop',
+                    }
+                ],
+                'usage': {'prompt_tokens': 5, 'completion_tokens': 2},
+            },
+        ]
+        recorded_payloads: list[dict[str, object]] = []
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            session_dir = workspace / '.port_sessions' / 'agent'
+            plugin_dir = workspace / 'plugins' / 'demo'
+            plugin_dir.mkdir(parents=True)
+            (plugin_dir / 'plugin.json').write_text(
+                json.dumps(
+                    {
+                        'name': 'demo-plugin',
+                        'hooks': {'beforePrompt': 'Plugin hook before prompt.'},
+                        'virtualTools': [
+                            {
+                                'name': 'demo_virtual',
+                                'description': 'Emit plugin state.',
+                                'responseTemplate': 'plugin state {topic}',
+                            }
+                        ],
+                    }
+                ),
+                encoding='utf-8',
+            )
+            with patch(
+                'src.openai_compat.request.urlopen',
+                side_effect=make_recording_urlopen_side_effect(responses, recorded_payloads),
+            ):
+                agent = LocalCodingAgent(
+                    model_config=ModelConfig(
+                        model='Qwen/Qwen3-Coder-30B-A3B-Instruct',
+                        base_url='http://127.0.0.1:8000/v1',
+                    ),
+                    runtime_config=AgentRuntimeConfig(
+                        cwd=workspace,
+                        session_directory=session_dir,
+                    ),
+                )
+                first = agent.run('Use the plugin virtual tool')
+                stored = load_agent_session(first.session_id or '', directory=session_dir)
+                resumed = LocalCodingAgent(
+                    model_config=ModelConfig(
+                        model='Qwen/Qwen3-Coder-30B-A3B-Instruct',
+                        base_url='http://127.0.0.1:8000/v1',
+                    ),
+                    runtime_config=AgentRuntimeConfig(
+                        cwd=workspace,
+                        session_directory=session_dir,
+                    ),
+                )
+                second = resumed.resume('Continue after plugin state', stored)
+        self.assertEqual(second.final_output, 'Resume consumed plugin runtime state.')
+        resumed_messages = recorded_payloads[-1]['messages']
+        assert isinstance(resumed_messages, list)
+        self.assertTrue(
+            any(
+                isinstance(message, dict)
+                and 'Plugin runtime state:' in str(message.get('content', ''))
+                and 'virtual_tool_results=1' in str(message.get('content', ''))
+                for message in resumed_messages
+            )
+        )
+
+    def test_plugin_lifecycle_hooks_are_persisted_and_reapplied_on_resume(self) -> None:
+        responses = [
+            {
+                'choices': [
+                    {
+                        'message': {
+                            'role': 'assistant',
+                            'content': 'Initial lifecycle run stored.',
+                        },
+                        'finish_reason': 'stop',
+                    }
+                ],
+                'usage': {'prompt_tokens': 5, 'completion_tokens': 2},
+            },
+            {
+                'choices': [
+                    {
+                        'message': {
+                            'role': 'assistant',
+                            'content': 'Resume observed plugin lifecycle hooks.',
+                        },
+                        'finish_reason': 'stop',
+                    }
+                ],
+                'usage': {'prompt_tokens': 6, 'completion_tokens': 2},
+            },
+        ]
+        recorded_payloads: list[dict[str, object]] = []
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            session_dir = workspace / '.port_sessions' / 'agent'
+            plugin_dir = workspace / 'plugins' / 'demo'
+            plugin_dir.mkdir(parents=True)
+            (plugin_dir / 'plugin.json').write_text(
+                json.dumps(
+                    {
+                        'name': 'demo-plugin',
+                        'hooks': {
+                            'onResume': 'Reapply the saved plugin lifecycle state on resume.',
+                            'beforePersist': 'Persist plugin lifecycle markers into the saved session.',
+                        },
+                    }
+                ),
+                encoding='utf-8',
+            )
+            with patch(
+                'src.openai_compat.request.urlopen',
+                side_effect=make_recording_urlopen_side_effect(responses, recorded_payloads),
+            ):
+                agent = LocalCodingAgent(
+                    model_config=ModelConfig(
+                        model='Qwen/Qwen3-Coder-30B-A3B-Instruct',
+                        base_url='http://127.0.0.1:8000/v1',
+                    ),
+                    runtime_config=AgentRuntimeConfig(
+                        cwd=workspace,
+                        session_directory=session_dir,
+                    ),
+                )
+                first = agent.run('Store the plugin lifecycle session')
+                stored = load_agent_session(first.session_id or '', directory=session_dir)
+                resumed = LocalCodingAgent(
+                    model_config=ModelConfig(
+                        model='Qwen/Qwen3-Coder-30B-A3B-Instruct',
+                        base_url='http://127.0.0.1:8000/v1',
+                    ),
+                    runtime_config=AgentRuntimeConfig(
+                        cwd=workspace,
+                        session_directory=session_dir,
+                    ),
+                )
+                second = resumed.resume('Continue after lifecycle persistence', stored)
+        self.assertEqual(second.final_output, 'Resume observed plugin lifecycle hooks.')
+        self.assertTrue(
+            any(
+                message.get('metadata', {}).get('kind') == 'plugin_persist'
+                and 'Persist plugin lifecycle markers into the saved session.' in str(message.get('content', ''))
+                for message in stored.messages
+            )
+        )
+        resumed_messages = recorded_payloads[-1]['messages']
+        assert isinstance(resumed_messages, list)
+        self.assertTrue(
+            any(
+                isinstance(message, dict)
+                and 'Plugin resume hooks:' in str(message.get('content', ''))
+                and 'Reapply the saved plugin lifecycle state on resume.' in str(message.get('content', ''))
+                for message in resumed_messages
+            )
+        )
+        self.assertTrue(any(event.get('type') == 'plugin_before_persist' for event in first.events))
+
+    def test_agent_can_delegate_with_dependency_aware_subtasks(self) -> None:
+        responses = [
+            {
+                'choices': [
+                    {
+                        'message': {
+                            'role': 'assistant',
+                            'content': 'Delegating dependency-aware subtasks.',
+                            'tool_calls': [
+                                {
+                                    'id': 'call_1',
+                                    'type': 'function',
+                                    'function': {
+                                        'name': 'delegate_agent',
+                                        'arguments': json.dumps(
+                                            {
+                                                'subtasks': [
+                                                    {
+                                                        'label': 'summarize',
+                                                        'prompt': 'Summarize the project.',
+                                                        'depends_on': ['scan'],
+                                                    },
+                                                    {
+                                                        'label': 'scan',
+                                                        'prompt': 'Scan the project.',
+                                                    },
+                                                ],
+                                                'max_turns': 2,
+                                            }
+                                        ),
+                                    },
+                                }
+                            ],
+                        },
+                        'finish_reason': 'tool_calls',
+                    }
+                ],
+                'usage': {'prompt_tokens': 8, 'completion_tokens': 3},
+            },
+            {
+                'choices': [
+                    {
+                        'message': {
+                            'role': 'assistant',
+                            'content': 'Child scan result.',
+                        },
+                        'finish_reason': 'stop',
+                    }
+                ],
+                'usage': {'prompt_tokens': 5, 'completion_tokens': 2},
+            },
+            {
+                'choices': [
+                    {
+                        'message': {
+                            'role': 'assistant',
+                            'content': 'Parent completed after dependency-aware delegation.',
+                        },
+                        'finish_reason': 'stop',
+                    }
+                ],
+                'usage': {'prompt_tokens': 7, 'completion_tokens': 2},
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            with patch('src.openai_compat.request.urlopen', side_effect=make_urlopen_side_effect(responses)):
+                agent = LocalCodingAgent(
+                    model_config=ModelConfig(
+                        model='Qwen/Qwen3-Coder-30B-A3B-Instruct',
+                        base_url='http://127.0.0.1:8000/v1',
+                    ),
+                    runtime_config=AgentRuntimeConfig(cwd=workspace),
+                )
+                result = agent.run('Use dependency-aware delegated subtasks')
+        self.assertEqual(result.final_output, 'Parent completed after dependency-aware delegation.')
+        child_events = [event for event in result.events if event.get('type') == 'delegate_subtask_result']
+        self.assertEqual(len(child_events), 2)
+        self.assertEqual(child_events[0].get('stop_reason'), 'pending_dependency')
+        self.assertEqual(child_events[1].get('stop_reason'), 'stop')
+
+    def test_agent_can_delegate_with_topological_batches(self) -> None:
+        responses = [
+            {
+                'choices': [
+                    {
+                        'message': {
+                            'role': 'assistant',
+                            'content': 'Delegating batched subtasks.',
+                            'tool_calls': [
+                                {
+                                    'id': 'call_1',
+                                    'type': 'function',
+                                    'function': {
+                                        'name': 'delegate_agent',
+                                        'arguments': json.dumps(
+                                            {
+                                                'subtasks': [
+                                                    {
+                                                        'label': 'summarize',
+                                                        'prompt': 'Summarize the project.',
+                                                        'depends_on': ['scan'],
+                                                    },
+                                                    {
+                                                        'label': 'scan',
+                                                        'prompt': 'Scan the project.',
+                                                    },
+                                                ],
+                                                'strategy': 'topological',
+                                                'max_turns': 2,
+                                            }
+                                        ),
+                                    },
+                                }
+                            ],
+                        },
+                        'finish_reason': 'tool_calls',
+                    }
+                ],
+                'usage': {'prompt_tokens': 8, 'completion_tokens': 3},
+            },
+            {
+                'choices': [
+                    {
+                        'message': {
+                            'role': 'assistant',
+                            'content': 'Child scan result.',
+                        },
+                        'finish_reason': 'stop',
+                    }
+                ],
+                'usage': {'prompt_tokens': 5, 'completion_tokens': 2},
+            },
+            {
+                'choices': [
+                    {
+                        'message': {
+                            'role': 'assistant',
+                            'content': 'Child summary result.',
+                        },
+                        'finish_reason': 'stop',
+                    }
+                ],
+                'usage': {'prompt_tokens': 5, 'completion_tokens': 2},
+            },
+            {
+                'choices': [
+                    {
+                        'message': {
+                            'role': 'assistant',
+                            'content': 'Parent completed after topological delegation.',
+                        },
+                        'finish_reason': 'stop',
+                    }
+                ],
+                'usage': {'prompt_tokens': 7, 'completion_tokens': 2},
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            with patch('src.openai_compat.request.urlopen', side_effect=make_urlopen_side_effect(responses)):
+                agent = LocalCodingAgent(
+                    model_config=ModelConfig(
+                        model='Qwen/Qwen3-Coder-30B-A3B-Instruct',
+                        base_url='http://127.0.0.1:8000/v1',
+                    ),
+                    runtime_config=AgentRuntimeConfig(cwd=workspace),
+                )
+                result = agent.run('Use topological delegated subtasks')
+        self.assertEqual(result.final_output, 'Parent completed after topological delegation.')
+        child_events = [event for event in result.events if event.get('type') == 'delegate_subtask_result']
+        self.assertEqual([event.get('label') for event in child_events], ['scan', 'summarize'])
+        self.assertEqual([event.get('batch_index') for event in child_events], [1, 2])
+        batch_events = [event for event in result.events if event.get('type') == 'delegate_batch_result']
+        self.assertEqual(len(batch_events), 2)
+        self.assertEqual(batch_events[0].get('status'), 'completed')
+        delegate_entry = next(
+            entry for entry in result.file_history if entry.get('action') == 'delegate_agent'
+        )
+        self.assertEqual(delegate_entry.get('delegate_batch_count'), 2)
+        self.assertEqual(delegate_entry.get('dependency_skips'), 0)
+        tool_message = next(
+            message
+            for message in result.transcript
+            if message.get('role') == 'tool'
+            and message.get('metadata', {}).get('action') == 'delegate_agent'
+        )
+        self.assertEqual(tool_message['metadata'].get('strategy'), 'topological')
+
     def test_agent_sends_response_schema_when_configured(self) -> None:
         responses = [
             {
