@@ -99,6 +99,9 @@ class ModelConfig:
     temperature: float = 0.0
     timeout_seconds: float = 120.0
     pricing: ModelPricing = field(default_factory=ModelPricing)
+    #: ``openai_compat`` uses the built-in HTTP client; ``langchain`` uses LangChain ChatOpenAI
+    #: (install optional extra ``langchain``).
+    model_backend: str = 'openai_compat'
 
 
 @dataclass(frozen=True)

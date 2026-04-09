@@ -251,6 +251,17 @@ class TestModelConfigSerialization(unittest.TestCase):
             pricing.cache_read_input_cost_per_million_tokens_usd,
         )
 
+    def test_round_trip_preserves_model_backend(self) -> None:
+        config = ModelConfig(model='m', model_backend='langchain')
+        payload = serialize_model_config(config)
+        restored = deserialize_model_config(payload)
+        self.assertEqual(restored.model_backend, 'langchain')
+
+    def test_deserialize_unknown_model_backend_defaults(self) -> None:
+        payload = {'model': 'm', 'model_backend': 'unknown'}
+        config = deserialize_model_config(payload)
+        self.assertEqual(config.model_backend, 'openai_compat')
+
     def test_deserialize_defaults_for_missing_fields(self) -> None:
         payload = {'model': 'gpt-4'}
         config = deserialize_model_config(payload)
@@ -260,6 +271,7 @@ class TestModelConfigSerialization(unittest.TestCase):
         self.assertEqual(config.api_key, 'local-token')
         self.assertAlmostEqual(config.temperature, 0.0)
         self.assertAlmostEqual(config.timeout_seconds, 120.0)
+        self.assertEqual(config.model_backend, 'openai_compat')
         self.assertAlmostEqual(config.pricing.input_cost_per_million_tokens_usd, 0.0)
         self.assertAlmostEqual(config.pricing.output_cost_per_million_tokens_usd, 0.0)
 

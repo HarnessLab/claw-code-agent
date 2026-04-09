@@ -34,3 +34,5 @@ test_cases
 e-commerce
 benchmarks/data/*.jsonl
 benchmarks/data/manifest.json
+.xhawk/
+.claude/settings.local.json

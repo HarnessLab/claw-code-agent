@@ -56,9 +56,29 @@ from .tool_pool import assemble_tool_pool
 from .tools import execute_tool, get_tool, get_tools, render_tool_index
 
 
+def _model_backend_from_args(args: argparse.Namespace) -> str:
+    explicit = getattr(args, 'model_backend', None)
+    if explicit is not None:
+        return str(explicit)
+    env = (os.environ.get('CLAW_MODEL_BACKEND') or '').strip().lower()
+    if env in ('openai_compat', 'langchain'):
+        return env
+    return 'openai_compat'
+
+
 def _add_agent_common_args(parser: argparse.ArgumentParser, *, include_backend: bool) -> None:
     parser.add_argument('--model', default=os.environ.get('OPENAI_MODEL', 'Qwen/Qwen3-Coder-30B-A3B-Instruct'))
     if include_backend:
+        parser.add_argument(
+            '--model-backend',
+            choices=('openai_compat', 'langchain'),
+            default=None,
+            help=(
+                'LLM client: openai_compat (default) or langchain '
+                '(requires: pip install claw-code-agent[langchain]). '
+                'Default may be set with CLAW_MODEL_BACKEND.'
+            ),
+        )
         parser.add_argument('--base-url', default=os.environ.get('OPENAI_BASE_URL', 'http://127.0.0.1:8000/v1'))
         parser.add_argument('--api-key', default=os.environ.get('OPENAI_API_KEY', 'local-token'))
         parser.add_argument('--temperature', type=float, default=0.0)
@@ -132,6 +152,7 @@ def _build_runtime_config(args: argparse.Namespace) -> AgentRuntimeConfig:
 def _build_model_config(args: argparse.Namespace) -> ModelConfig:
     return ModelConfig(
         model=args.model,
+        model_backend=_model_backend_from_args(args),
         base_url=getattr(args, 'base_url', os.environ.get('OPENAI_BASE_URL', 'http://127.0.0.1:8000/v1')),
         api_key=getattr(args, 'api_key', os.environ.get('OPENAI_API_KEY', 'local-token')),
         temperature=getattr(args, 'temperature', 0.0),
@@ -182,6 +203,7 @@ def _append_agent_forwarded_args(
     command.extend(['--max-turns', str(getattr(args, 'max_turns', 12))])
     if include_backend:
         command.extend(['--model', str(args.model)])
+        command.extend(['--model-backend', _model_backend_from_args(args)])
         command.extend(['--base-url', str(args.base_url)])
         command.extend(['--api-key', str(args.api_key)])
         command.extend(['--temperature', str(args.temperature)])
@@ -236,6 +258,12 @@ def _add_agent_resume_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument('--max-turns', type=int)
     parser.add_argument('--show-transcript', action='store_true')
     parser.add_argument('--model')
+    parser.add_argument(
+        '--model-backend',
+        choices=('openai_compat', 'langchain'),
+        default=None,
+        help='Override saved session model backend (optional).',
+    )
     parser.add_argument('--base-url')
     parser.add_argument('--api-key')
     parser.add_argument('--temperature', type=float)
@@ -327,6 +355,8 @@ def _build_resumed_agent(args: argparse.Namespace) -> tuple[LocalCodingAgent, St
         model_config = replace(model_config, base_url=args.base_url)
     if args.api_key:
         model_config = replace(model_config, api_key=args.api_key)
+    if getattr(args, 'model_backend', None) is not None:
+        model_config = replace(model_config, model_backend=args.model_backend)
     if args.temperature is not None:
         model_config = replace(model_config, temperature=args.temperature)
     if args.timeout_seconds is not None:

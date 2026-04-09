@@ -43,6 +43,7 @@ from .agent_types import (
     ToolExecutionResult,
     UsageStats,
 )
+from .langchain_model import LangChainChatClient
 from .openai_compat import OpenAICompatClient, OpenAICompatError
 from .plan_runtime import PlanRuntime
 from .plugin_runtime import PluginRuntime
@@ -68,6 +69,20 @@ from .session_store import (
 class BudgetDecision:
     exceeded: bool
     reason: str | None = None
+
+
+def build_model_client(
+    config: ModelConfig,
+) -> OpenAICompatClient | LangChainChatClient:
+    backend = (config.model_backend or 'openai_compat').strip().lower()
+    if backend == 'langchain':
+        return LangChainChatClient(config)
+    if backend == 'openai_compat':
+        return OpenAICompatClient(config)
+    raise ValueError(
+        f'Unknown model_backend {config.model_backend!r}; '
+        "expected 'openai_compat' or 'langchain'."
+    )
 
 
 @dataclass
@@ -178,7 +193,7 @@ class LocalCodingAgent:
         if virtual_tools:
             registry = {**registry, **virtual_tools}
         self.tool_registry = registry
-        self.client = OpenAICompatClient(self.model_config)
+        self.client = build_model_client(self.model_config)
         self.tool_context = build_tool_context(
             self.runtime_config,
             tool_registry=self.tool_registry,
@@ -203,7 +218,7 @@ class LocalCodingAgent:
 
     def set_model(self, model: str) -> None:
         self.model_config = replace(self.model_config, model=model)
-        self.client = OpenAICompatClient(self.model_config)
+        self.client = build_model_client(self.model_config)
 
     def clear_runtime_state(self) -> None:
         self.last_session = None

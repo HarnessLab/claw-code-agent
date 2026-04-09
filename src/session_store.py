@@ -118,6 +118,7 @@ def load_agent_session(session_id: str, directory: Path | None = None) -> Stored
 def serialize_model_config(model_config: ModelConfig) -> JSONDict:
     return {
         'model': model_config.model,
+        'model_backend': model_config.model_backend,
         'base_url': model_config.base_url,
         'api_key': model_config.api_key,
         'temperature': model_config.temperature,
@@ -132,8 +133,15 @@ def serialize_model_config(model_config: ModelConfig) -> JSONDict:
 
 
 def deserialize_model_config(payload: JSONDict) -> ModelConfig:
+    backend = payload.get('model_backend', 'openai_compat')
+    if not isinstance(backend, str):
+        backend = 'openai_compat'
+    else:
+        normalized = backend.strip().lower()
+        backend = normalized if normalized in ('openai_compat', 'langchain') else 'openai_compat'
     return ModelConfig(
         model=str(payload['model']),
+        model_backend=backend,
         base_url=str(payload.get('base_url', 'http://127.0.0.1:8000/v1')),
         api_key=str(payload.get('api_key', 'local-token')),
         temperature=float(payload.get('temperature', 0.0)),
