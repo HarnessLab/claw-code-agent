@@ -12,26 +12,24 @@ dist/
 archive/
 .omx/
 .clawd-agents/
-
 # Local agent/runtime artifacts
 .claude/
 .claude.json
+.claw/
 .port_sessions/
-
 # Environment files
 .env
 .env.*
-
 # Local benchmark outputs
 benchmark_artifacts/
 jobs/
 output_terminal/
 tb2*.json
 humaneval_results.json
-
-
 test_cases
 e-commerce
 benchmarks/data/*.jsonl
 benchmarks/data/manifest.json
+/IDENTITY.md
 claude-code-sourcemap-main
+.latti/

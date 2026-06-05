@@ -94,6 +94,7 @@ class BenchmarkSuite(ABC):
         verbose: bool = False,
         artifacts_dir: str | None = None,
         save_passing_artifacts: bool = False,
+        rate_limit_seconds: float = 2.0,
     ) -> None:
         self.data_dir = data_dir or str(
             Path(__file__).resolve().parent.parent / "data"
@@ -104,6 +105,7 @@ class BenchmarkSuite(ABC):
         self.artifacts_dir = artifacts_dir
         self.save_passing_artifacts = save_passing_artifacts
         self.project_root = str(Path(__file__).resolve().parent.parent.parent)
+        self.rate_limit_seconds = rate_limit_seconds
 
     @abstractmethod
     def load_dataset(self) -> list[dict[str, Any]]:
@@ -123,6 +125,15 @@ class BenchmarkSuite(ABC):
         cwd: str,
         timeout: float = 30.0,
     ) -> tuple[int, str]:
+        import copy
+        # Explicitly forward model credentials + disable behavioral gate for benchmarks
+        env = dict(os.environ)  # true copy — copy.copy(os.environ) returns _Environ which mutates real env
+        for key in ('OPENAI_MODEL', 'OPENAI_BASE_URL', 'OPENAI_API_KEY',
+                    'LATTI_COPILOT_HEADERS', 'LATTI_MODEL_HEAVY',
+                    'LATTI_MODEL_LIGHT', 'LATTI_MODEL_MICRO'):
+            if key in os.environ:
+                env[key] = os.environ[key]
+        env['LATTI_GATE'] = '0'  # disable response gate — benchmarks need clean output
         try:
             proc = subprocess.run(
                 cmd,
@@ -131,6 +142,7 @@ class BenchmarkSuite(ABC):
                 capture_output=True,
                 text=True,
                 timeout=timeout,
+                env=env,
             )
             return proc.returncode, (proc.stdout + proc.stderr).strip()
         except subprocess.TimeoutExpired:
@@ -141,12 +153,20 @@ class BenchmarkSuite(ABC):
     def run_agent(self, instruction: str, workspace: str) -> tuple[int, str, float]:
         import shlex
 
+        # Pick up model endpoint from environment (set by latti shim or caller)
+        model    = os.environ.get('OPENAI_MODEL', 'anthropic/claude-sonnet-4.6')
+        base_url = os.environ.get('OPENAI_BASE_URL', 'https://openrouter.ai/api/v1')
+        api_key  = os.environ.get('OPENAI_API_KEY', '')
+
         agent_cmd = (
             f"{sys.executable} -m src.main agent "
             f"{shlex.quote(instruction)} "
             f"--cwd {shlex.quote(workspace)} "
             f"--allow-write "
-            f"--allow-shell"
+            f"--allow-shell "
+            f"--model {shlex.quote(model)} "
+            f"--base-url {shlex.quote(base_url)} "
+            + (f"--api-key {shlex.quote(api_key)} " if api_key else "")
         )
         if self.verbose:
             print(f"  agent cmd: {agent_cmd[:160]}...")
@@ -245,6 +265,10 @@ class BenchmarkSuite(ABC):
         for index, problem in enumerate(problems, 1):
             pid = str(problem.get("id", problem.get("task_id", f"problem-{index}")))
             print(f"[{index}/{len(problems)}] {pid}")
+
+            # Rate limit between problems to avoid 429s from Copilot/OpenRouter
+            if index > 1 and self.rate_limit_seconds > 0:
+                time.sleep(self.rate_limit_seconds)
 
             workspace = make_temp_workspace("claw", self.name, pid)
             prompt = ""

@@ -65,6 +65,26 @@ def redact_secrets(text: str) -> str:
     return redacted
 MAX_MUTATION_HISTORY = 8
 
+# Compiled once: load-bearing prefixes that auto-anchor a user message.
+# Must appear at the start of a line (^ in MULTILINE mode), case-insensitive,
+# followed by a colon. Tested by tests/test_append_user_auto_anchor.py.
+_AUTO_ANCHOR_PREFIXES = re.compile(
+    r'(?im)^(MISSION|CORRECTION|IMPORTANT|NEVER|ALWAYS):'
+)
+
+
+def _should_auto_anchor(content: str) -> bool:
+    """True if the message starts a line with a load-bearing prefix.
+
+    These messages (mission directives, hard corrections, must/never
+    constraints) are exactly the content that compounds-blurs across
+    successive compactions if treated as routine. Auto-anchoring keeps
+    them verbatim across every compaction.
+    """
+    if not content:
+        return False
+    return _AUTO_ANCHOR_PREFIXES.search(content) is not None
+
 
 @dataclass(frozen=True)
 class AgentMessage:
@@ -348,6 +368,14 @@ class AgentSessionState:
         metadata: dict[str, Any] | None = None,
         message_id: str | None = None,
     ) -> None:
+        # Auto-anchor heuristic: messages starting a line with
+        # MISSION:/CORRECTION:/IMPORTANT:/NEVER:/ALWAYS: are load-bearing
+        # context that should never compound-blur through compaction.
+        # Caller can override in either direction by setting
+        # metadata['anchor'] explicitly.
+        merged_meta = dict(metadata or {})
+        if 'anchor' not in merged_meta and _should_auto_anchor(content):
+            merged_meta['anchor'] = True
         self.messages.append(
             AgentMessage(
                 role='user',
@@ -356,7 +384,7 @@ class AgentSessionState:
                 metadata=_initialize_message_metadata(
                     role='user',
                     message_id=message_id or f'user_{len(self.messages)}',
-                    metadata=dict(metadata or {}),
+                    metadata=merged_meta,
                 ),
                 message_id=message_id,
             )
@@ -538,7 +566,8 @@ class AgentSessionState:
         )
 
     def to_openai_messages(self) -> list[JSONDict]:
-        return [message.to_openai_message() for message in self.messages]
+        raw = [message.to_openai_message() for message in self.messages]
+        return _strip_orphan_tool_results(raw)
 
     def transcript(self) -> tuple[JSONDict, ...]:
         return tuple(message.to_transcript_entry() for message in self.messages)
@@ -573,6 +602,48 @@ class AgentSessionState:
                 default=0,
             ),
         )
+
+
+def _strip_orphan_tool_results(messages: list[JSONDict]) -> list[JSONDict]:
+    """Drop role=tool messages whose tool_call_id was never announced.
+
+    Auto-compaction can drop the assistant message that issued a tool_use
+    while keeping the corresponding tool_result. Sending that to Anthropic
+    returns:
+        messages.0.content.0: unexpected `tool_use_id` found in
+        `tool_result` blocks: <id>. Each `tool_result` block must have a
+        corresponding `tool_use` block in the previous message.
+
+    This filter walks messages in order, tracks the set of tool_call ids
+    announced by prior assistant messages, and drops any role=tool whose
+    id is not in that set. Idempotent. No effect on sessions without
+    tool calls.
+
+    Tested by tests/test_orphan_tool_result_strip.py.
+    """
+    announced: set[str] = set()
+    out: list[JSONDict] = []
+    for msg in messages:
+        role = msg.get('role')
+        if role == 'assistant':
+            tool_calls = msg.get('tool_calls')
+            if isinstance(tool_calls, list):
+                for tc in tool_calls:
+                    if isinstance(tc, dict):
+                        tc_id = tc.get('id')
+                        if isinstance(tc_id, str):
+                            announced.add(tc_id)
+            out.append(msg)
+            continue
+        if role == 'tool':
+            call_id = msg.get('tool_call_id')
+            if isinstance(call_id, str) and call_id in announced:
+                out.append(msg)
+            # else: orphan — drop silently. Logging here would noise the TUI;
+            # callers can detect by length-mismatch if they care.
+            continue
+        out.append(msg)
+    return out
 
 
 def _usage_from_payload(payload: Any) -> UsageStats:

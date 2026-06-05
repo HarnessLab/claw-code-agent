@@ -1,13 +1,26 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
-from src.main import _build_runtime_config, _build_agent, _run_agent_chat_loop, build_parser, main
+from src.background_runtime import BackgroundSessionRecord, BackgroundSessionRuntime
+from src.main import (
+    _build_runtime_config,
+    _build_agent,
+    _run_agent_chat_loop,
+    _run_background_worker,
+    _render_worker_event_to_tui,
+    build_parser,
+    main,
+)
+from src.agent_types import AgentRunResult
+from src.tui_supervisor import read_worker_events
 
 
 class FakeHTTPResponse:
@@ -129,6 +142,256 @@ class MainCliTests(unittest.TestCase):
         self.assertEqual(recorded_results, ['First chat reply.', 'Second chat reply.'])
         self.assertIn('# Agent Chat', recorded_lines)
         self.assertIn('chat_ended=user_exit', recorded_lines)
+
+    def test_agent_chat_loop_can_use_worker_runner(self) -> None:
+        recorded_results: list[str] = []
+        recorded_lines: list[str] = []
+        worker_calls: list[tuple[str, str | None]] = []
+        prompts = iter(['Second prompt', '/exit'])
+
+        def _input(prompt: str) -> str:
+            return next(prompts)
+
+        def _output(line: str) -> None:
+            recorded_lines.append(line)
+
+        def _result_printer(result, *, show_transcript: bool) -> None:  # noqa: ANN001
+            recorded_results.append(result.final_output)
+
+        def _worker_runner(prompt: str, resume_session_id: str | None):
+            worker_calls.append((prompt, resume_session_id))
+            session_id = resume_session_id or 'worker_session_1'
+            return AgentRunResult(
+                final_output=f'worker:{prompt}',
+                turns=1,
+                tool_calls=0,
+                transcript=(),
+                session_id=session_id,
+            )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            parser = build_parser()
+            args = parser.parse_args(
+                [
+                    'agent-chat',
+                    'First prompt',
+                    '--model',
+                    'test-model',
+                    '--cwd',
+                    str(workspace),
+                ]
+            )
+            agent = _build_agent(args)
+            exit_code = _run_agent_chat_loop(
+                agent,
+                initial_prompt=args.prompt,
+                resume_session_id=None,
+                show_transcript=False,
+                input_func=_input,
+                output_func=_output,
+                result_printer=_result_printer,
+                worker_runner=_worker_runner,
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            worker_calls,
+            [('First prompt', None), ('Second prompt', 'worker_session_1')],
+        )
+        self.assertEqual(
+            recorded_results,
+            ['worker:First prompt', 'worker:Second prompt'],
+        )
+
+    def test_background_worker_writes_runtime_events(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir) / 'background'
+            runtime = BackgroundSessionRuntime(root)
+            background_id = 'bg_events'
+            record = BackgroundSessionRecord(
+                background_id=background_id,
+                pid=123,
+                prompt='prompt',
+                workspace_cwd=str(Path(tmp_dir)),
+                model='test-model',
+                mode='chat',
+                status='running',
+                log_path=str(runtime.log_path(background_id)),
+                record_path=str(runtime.record_path(background_id)),
+                started_at='2026-04-29T00:00:00+00:00',
+                command=('python3', '-m', 'src.main'),
+            )
+            runtime.save_record(record)
+
+            class FakeAgent:
+                runtime_event_sink = None
+
+                def run(self, prompt: str) -> AgentRunResult:
+                    assert prompt == 'prompt'
+                    assert self.runtime_event_sink is not None
+                    self.runtime_event_sink({'type': 'content_delta', 'delta': 'live'})
+                    return AgentRunResult(
+                        final_output='live',
+                        turns=1,
+                        tool_calls=0,
+                        transcript=(),
+                        events=({'type': 'content_delta', 'delta': 'live'},),
+                        session_id='sess_live',
+                    )
+
+            args = SimpleNamespace(
+                background_root=str(root),
+                background_id=background_id,
+                prompt='prompt',
+                resume_session_id=None,
+                show_transcript=False,
+            )
+
+            with patch('src.main._build_agent', return_value=FakeAgent()):
+                exit_code = _run_background_worker(args)
+
+            events, _ = read_worker_events(root, background_id)
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(events, [{'type': 'content_delta', 'delta': 'live'}])
+
+    def test_worker_state_machine_events_render_to_tui_info(self) -> None:
+        calls: list[tuple[str, str]] = []
+
+        class FakeTui:
+            @staticmethod
+            def info(text: str) -> None:
+                calls.append(('info', text))
+
+        renderer = _render_worker_event_to_tui(
+            {
+                'type': 'state_machine_decision',
+                'action_kind': 'llm_call',
+                'rationale': 'rule_fired: runtime_query_model',
+            },
+            tui=FakeTui,
+            stream_renderer=None,
+        )
+        renderer = _render_worker_event_to_tui(
+            {
+                'type': 'session_checkpoint',
+                'session_id': 'abcdef1234567890',
+                'typed_state_checkpointed': True,
+            },
+            tui=FakeTui,
+            stream_renderer=renderer,
+        )
+
+        self.assertIsNone(renderer)
+        self.assertEqual(
+            calls,
+            [
+                ('info', 'state-machine: llm_call - runtime_query_model'),
+                ('info', 'checkpoint: abcdef123456 typed-state saved'),
+            ],
+        )
+
+    def test_agent_chat_defaults_to_supervisor_for_interactive_tty(self) -> None:
+        fake_agent = SimpleNamespace()
+
+        def _worker_runner(prompt: str, resume_session_id: str | None) -> AgentRunResult:
+            return AgentRunResult(
+                final_output='unused',
+                turns=0,
+                tool_calls=0,
+                transcript=(),
+                session_id=resume_session_id,
+            )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with patch.dict(os.environ, {'LATTI_BOOT': '0'}, clear=False):
+                with patch('src.main._build_agent', return_value=fake_agent):
+                    with patch(
+                        'src.main._build_background_chat_worker_runner',
+                        return_value=_worker_runner,
+                    ) as build_worker_runner:
+                        with patch(
+                            'src.main._run_agent_chat_loop',
+                            return_value=0,
+                        ) as run_chat_loop:
+                            with patch('sys.stdin.isatty', return_value=True):
+                                with patch('sys.stdout.isatty', return_value=True):
+                                    exit_code = main(
+                                        ['agent-chat', 'hello', '--cwd', tmp_dir]
+                                    )
+
+        self.assertEqual(exit_code, 0)
+        build_worker_runner.assert_called_once()
+        self.assertIs(run_chat_loop.call_args.kwargs['worker_runner'], _worker_runner)
+
+    def test_agent_chat_supervisor_has_escape_hatch(self) -> None:
+        fake_agent = SimpleNamespace()
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with patch.dict(
+                os.environ,
+                {
+                    'LATTI_BOOT': '0',
+                    'LATTI_USE_CHAT_SUPERVISOR': '0',
+                    'LATTI_FORCE_CHAT_SUPERVISOR': '1',
+                },
+                clear=False,
+            ):
+                with patch('src.main._build_agent', return_value=fake_agent):
+                    with patch(
+                        'src.main._build_background_chat_worker_runner',
+                    ) as build_worker_runner:
+                        with patch(
+                            'src.main._run_agent_chat_loop',
+                            return_value=0,
+                        ) as run_chat_loop:
+                            with patch('sys.stdin.isatty', return_value=True):
+                                with patch('sys.stdout.isatty', return_value=True):
+                                    exit_code = main(
+                                        ['agent-chat', 'hello', '--cwd', tmp_dir]
+                                    )
+
+        self.assertEqual(exit_code, 0)
+        build_worker_runner.assert_not_called()
+        self.assertIsNone(run_chat_loop.call_args.kwargs['worker_runner'])
+
+    def test_agent_chat_supervisor_can_be_forced_for_non_tty_smoke(self) -> None:
+        fake_agent = SimpleNamespace()
+
+        def _worker_runner(prompt: str, resume_session_id: str | None) -> AgentRunResult:
+            return AgentRunResult(
+                final_output='unused',
+                turns=0,
+                tool_calls=0,
+                transcript=(),
+                session_id=resume_session_id,
+            )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with patch.dict(
+                os.environ,
+                {'LATTI_BOOT': '0', 'LATTI_FORCE_CHAT_SUPERVISOR': '1'},
+                clear=False,
+            ):
+                with patch('src.main._build_agent', return_value=fake_agent):
+                    with patch(
+                        'src.main._build_background_chat_worker_runner',
+                        return_value=_worker_runner,
+                    ) as build_worker_runner:
+                        with patch(
+                            'src.main._run_agent_chat_loop',
+                            return_value=0,
+                        ) as run_chat_loop:
+                            with patch('sys.stdin.isatty', return_value=False):
+                                with patch('sys.stdout.isatty', return_value=False):
+                                    exit_code = main(
+                                        ['agent-chat', 'hello', '--cwd', tmp_dir]
+                                    )
+
+        self.assertEqual(exit_code, 0)
+        build_worker_runner.assert_called_once()
+        self.assertIs(run_chat_loop.call_args.kwargs['worker_runner'], _worker_runner)
 
     def test_parser_accepts_remote_runtime_commands(self) -> None:
         parser = build_parser()

@@ -39,10 +39,43 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
+from pathlib import Path
 
 from benchmarks.suites.base import BenchmarkSuite, SuiteReport
+
+
+def _load_env_file() -> None:
+    """Load environment variables from ~/.latti/.env if it exists."""
+    env_file = Path.home() / ".latti" / ".env"
+    if env_file.exists():
+        try:
+            with open(env_file) as f:
+                for line in f:
+                    line = line.strip()
+                    # Skip comments and empty lines
+                    if not line or line.startswith("#"):
+                        continue
+                    # Parse KEY=VALUE
+                    if "=" in line:
+                        key, value = line.split("=", 1)
+                        key = key.strip()
+                        value = value.strip()
+                        # Only set if not already in environment
+                        if key and key not in os.environ:
+                            os.environ[key] = value
+        except Exception:
+            pass  # Silently ignore errors reading .env file
+
+
+# Load environment variables from ~/.latti/.env
+_load_env_file()
+
+# Map OPENROUTER_API_KEY to OPENAI_API_KEY if needed
+if "OPENROUTER_API_KEY" in os.environ and "OPENAI_API_KEY" not in os.environ:
+    os.environ["OPENAI_API_KEY"] = os.environ["OPENROUTER_API_KEY"]
 
 # Import all suites
 from benchmarks.suites.humaneval import HumanEvalBenchmark

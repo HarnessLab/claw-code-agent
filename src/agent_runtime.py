@@ -2,9 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
+import itertools
 import json
+import os
 from pathlib import Path
-from typing import Any
+import subprocess
+import sys
+from typing import Any, Callable
 from uuid import uuid4
 
 from .account_runtime import AccountRuntime
@@ -29,6 +33,8 @@ from .config_runtime import ConfigRuntime
 from .hook_policy import HookPolicyRuntime
 from .lsp_runtime import LSPRuntime
 from .mcp_runtime import MCPRuntime
+from .scar_router import ScarRouter
+from .priority_router import PriorityRouter
 from .agent_prompting import (
     build_prompt_context,
     build_system_prompt_parts,
@@ -36,6 +42,7 @@ from .agent_prompting import (
 )
 from .agent_session import AgentSessionState
 from .agent_slash_commands import preprocess_slash_command
+from .response_gate import apply_response_gate
 from .agent_tools import (
     AgentTool,
     build_tool_context,
@@ -56,6 +63,7 @@ from .agent_types import (
     ToolExecutionResult,
     UsageStats,
 )
+from .model_router import ModelRouter, RouterConfig, RoutingDecision, Tier
 from .openai_compat import OpenAICompatClient, OpenAICompatError
 from .plan_runtime import PlanRuntime
 from .plugin_runtime import PluginRuntime
@@ -83,6 +91,61 @@ from .builtin_agents import (
     GENERAL_PURPOSE_AGENT,
 )
 from .microcompact import microcompact_messages as _microcompact_messages
+
+_LATTI_DIR = Path.home() / '.latti'
+_IDENTITY_SHIM = _LATTI_DIR / 'scripts' / 'identity_compile.py'
+
+
+class _ObservableEventList(list[dict[str, object]]):
+    def __init__(self, event_sink: Callable[[dict[str, object]], None]) -> None:
+        super().__init__()
+        self._event_sink = event_sink
+
+    def append(self, event: dict[str, object]) -> None:  # type: ignore[override]
+        super().append(event)
+        self._emit(event)
+
+    def extend(self, events) -> None:  # type: ignore[override]
+        for event in events:
+            self.append(event)
+
+    def _emit(self, event: dict[str, object]) -> None:
+        try:
+            self._event_sink(dict(event))
+        except Exception:
+            pass
+
+
+def _maybe_spawn_identity_compiler() -> None:
+    """Fire-and-forget spawn of the identity compiler at session end.
+
+    Gated on LATTI_IDENTITY_COMPILE=1 so existing test fixtures that build
+    runtime instances don't accidentally trigger compiles. Any failure
+    (missing shim, Popen error) is silently swallowed — must NOT affect
+    the run() return value.
+    """
+    if os.environ.get('LATTI_IDENTITY_COMPILE') != '1':
+        return
+    if not _IDENTITY_SHIM.is_file():
+        return
+    try:
+        subprocess.Popen(
+            [
+                sys.executable, str(_IDENTITY_SHIM),
+                '--memory-dir',   str(_LATTI_DIR / 'memory'),
+                '--identity-out', str(_LATTI_DIR / 'IDENTITY.md'),
+                '--history-out',  str(_LATTI_DIR / 'HISTORY.md'),
+                '--cursor-path',  str(_LATTI_DIR / '.history-cursor'),
+                '--meta-path',    str(_LATTI_DIR / '.identity-meta.json'),
+                '--log-path',     str(_LATTI_DIR / 'identity-compile.log'),
+                '--goals-path',   str(_LATTI_DIR / 'goals.jsonl'),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except (OSError, ValueError):
+        return
 
 
 @dataclass(frozen=True)
@@ -136,12 +199,35 @@ class LocalCodingAgent:
     last_session_path: str | None = field(default=None, init=False, repr=False)
     managed_agent_id: str | None = field(default=None, init=False, repr=False)
     resume_source_session_id: str | None = field(default=None, init=False, repr=False)
+    model_router: ModelRouter | None = field(default=None, init=False, repr=False)
+    scar_router: ScarRouter | None = field(default=None, init=False, repr=False)
+    # Stash for per-tool evaluator events. _dispatch_via_state_machine
+    # appends here after each tool step; the LLM-call hook drains before
+    # firing its own eval. Preserves 'replan' verdicts across multi-tool
+    # turns where state.last_observation would otherwise be clobbered.
+    _pending_eval_events: list = field(default_factory=list, init=False, repr=False)
+    # State-machine bridge — PRIMARY path (Step 6 default-on, 2026-04-29).
+    # Lazy construction; opt OUT via LATTI_USE_STATE_MACHINE=0 if you need
+    # the legacy execute_tool_streaming fallback. The typed loop replaces
+    # legacy; legacy is fallback only.
+    _sm_runner: 'object | None' = field(default=None, init=False, repr=False)
+    _sm_state: 'object | None' = field(default=None, init=False, repr=False)
+    _sm_memory: 'object | None' = field(default=None, init=False, repr=False)
+    _sm_goals: 'object | None' = field(default=None, init=False, repr=False)
+    _sm_tasks: 'object | None' = field(default=None, init=False, repr=False)
+    runtime_event_sink: Callable[[dict[str, object]], None] | None = field(
+        default=None,
+        init=False,
+        repr=False,
+    )
 
     def __post_init__(self) -> None:
         if self.tool_registry is None:
             self.tool_registry = default_tool_registry()
         if self.agent_manager is None:
             self.agent_manager = AgentManager()
+        if self.scar_router is None:
+            self.scar_router = ScarRouter()
         if self.plugin_runtime is None:
             self.plugin_runtime = PluginRuntime.from_workspace(
                 self.runtime_config.cwd,
@@ -215,6 +301,7 @@ class LocalCodingAgent:
             registry = {**registry, **virtual_tools}
         self.tool_registry = registry
         self.client = OpenAICompatClient(self.model_config)
+        self.model_router = ModelRouter(RouterConfig.from_env(), default_heavy_model=self.model_config.model)
         self.tool_context = build_tool_context(
             self.runtime_config,
             tool_registry=self.tool_registry,
@@ -361,7 +448,35 @@ class LocalCodingAgent:
         if self.plugin_runtime is not None:
             self.plugin_runtime.restore_session_state({})
         session_id = uuid4().hex
+        # Write new session ID to ~/.latti/last_session so the latti shim
+        # and audit journal always see the current session UUID, not a stale one.
+        try:
+            import pathlib
+            _latti_home = pathlib.Path.home() / '.latti'
+            if _latti_home.is_dir():
+                (_latti_home / 'last_session').write_text(session_id, encoding='utf-8')
+        except Exception:
+            pass
         scratchpad_directory = self._ensure_scratchpad_directory(session_id)
+        
+        # ROTATION ACTIVATION: Check if rotation signal exists and activate if needed
+        # This switches the agent to self-axis mode if the rotation gate fired
+        prompt = self._check_rotation_activation(prompt)
+        
+        # Pre-response: inject any claim-matches into system prompt so echoes
+        # of prior claims are recognized structurally, not re-reasoned.
+        self._inject_claim_matches(prompt)
+        
+        # Pre-response: inject finalization context if the prompt contains
+        # finalization keywords to guide response format and structure.
+        self._inject_response_finalization_context(prompt)
+        
+        # Layer 4: Inject next priority before response generation
+        # This prevents "what next?" routing by making the next action explicit
+        self._inject_next_priority()
+        
+        self._bind_state_machine_session(session_id)
+        registered_goal = self._register_goal_from_prompt(prompt, session_id)
         result = self._run_prompt(
             prompt,
             base_session=None,
@@ -371,7 +486,99 @@ class LocalCodingAgent:
         )
         self._accumulate_usage(result)
         self._finalize_managed_agent(result)
+        # Mark the registered Goal as done only on a clean stop_reason.
+        # Exclude error/timeout-class outcomes so a budget-exhausted or
+        # max-turns-truncated run doesn't mislabel an unfinished Goal as done.
+        _GOAL_NOT_DONE_STOP_REASONS = {
+            None, 'error', 'backend_error', 'budget_exceeded',
+            'max_turns', 'max_tool_calls', 'max_model_calls',
+        }
+        if registered_goal is not None and result.stop_reason not in _GOAL_NOT_DONE_STOP_REASONS:
+            self._mark_goal_done(registered_goal)
+
+        # ROTATION GATE: Check if we should rotate to self-directed work
+        # This is the decision point that prevents orbit
+        self._check_rotation_gate(result)
+
+        # OUTCOME RECORDING: Record self-axis task outcomes for feedback loop
+        # This enables pattern learning and harness refinement
+        self._record_self_axis_outcome(result)
+
+        _maybe_spawn_identity_compiler()
         return result
+
+    def _inject_next_priority(self) -> None:
+        """Pre-response hook: inject "next action" priority context.
+
+        Originally introduced by commit 84bc6a7 with a call site but no
+        body — agent.run() raised AttributeError on every invocation,
+        which surfaced live as "Worker exited before returning a result"
+        on every chat turn (worker subprocess crashed on the missing
+        method before producing a result file).
+
+        Currently a no-op: callable, returns None, no side effects.
+        The originally intended behavior (read priorities from somewhere
+        and append to system prompt) is not specified in the commit
+        that introduced the call site; the load-bearing fix is
+        unbreaking the chat loop, not inventing semantics.
+
+        Tested by tests/test_inject_next_priority_unbreak.py.
+        """
+        return None
+
+    def _inject_claim_matches(self, prompt: str) -> None:
+        """Pre-response hook: if the incoming prompt echoes prior claims,
+        append the matches to append_system_prompt so the LLM sees the echo
+        before responding. Best-effort; no-op without Latti."""
+        import sys
+        from pathlib import Path
+        try:
+            latti_home = Path.home() / '.latti'
+            if not (latti_home / 'last_session').is_file():
+                return
+            if not prompt or len(prompt) < 20:
+                return
+            scripts = latti_home / 'scripts'
+            if str(scripts) not in sys.path:
+                sys.path.insert(0, str(scripts))
+            from claims import match_for_injection  # type: ignore[import-not-found]
+            injection = match_for_injection(prompt)
+            if not injection:
+                return
+            # Append to the system prompt for this turn
+            existing = self.append_system_prompt or ''
+            self.append_system_prompt = existing + injection
+        except Exception:
+            pass
+
+    def _inject_response_finalization_context(self, prompt: str) -> None:
+        """Pre-response hook: inject response finalization context if the prompt
+        contains finalization keywords. This helps the LLM understand the expected
+        response format and constraints."""
+        try:
+            # Check if prompt contains finalization-related keywords
+            finalization_keywords = [
+                'finalize', 'finalization', 'final response', 'wrap up',
+                'conclude', 'summary', 'complete', 'done', 'finish'
+            ]
+            prompt_lower = prompt.lower()
+            if not any(keyword in prompt_lower for keyword in finalization_keywords):
+                return
+            
+            # Inject finalization context
+            finalization_context = (
+                "\n\n[RESPONSE FINALIZATION CONTEXT]\n"
+                "When finalizing your response:\n"
+                "1. Summarize key findings or decisions\n"
+                "2. Highlight any blockers or dependencies\n"
+                "3. Provide clear next steps if applicable\n"
+                "4. Use structured format (bullets, sections) for clarity\n"
+                "5. Avoid trailing questions unless explicitly requested\n"
+            )
+            existing = self.append_system_prompt or ''
+            self.append_system_prompt = existing + finalization_context
+        except Exception:
+            pass
 
     def resume(self, prompt: str, stored_session: StoredAgentSession) -> AgentRunResult:
         self.managed_agent_id = None
@@ -399,6 +606,9 @@ class LocalCodingAgent:
             if stored_session.scratchpad_directory
             else self._ensure_scratchpad_directory(stored_session.session_id)
         )
+        if not self._restore_persisted_state_machine_state(stored_session):
+            self._bind_state_machine_session(stored_session.session_id)
+        registered_goal = self._register_goal_from_prompt(prompt, stored_session.session_id)
         result = self._run_prompt(
             prompt,
             base_session=session,
@@ -408,6 +618,14 @@ class LocalCodingAgent:
         )
         self._accumulate_usage(result)
         self._finalize_managed_agent(result)
+        # Mirror run()'s clean-stop-marks-done behavior so resume sessions
+        # close their goals symmetrically. Same exclusion list.
+        _GOAL_NOT_DONE_STOP_REASONS = {
+            None, 'error', 'backend_error', 'budget_exceeded',
+            'max_turns', 'max_tool_calls', 'max_model_calls',
+        }
+        if registered_goal is not None and result.stop_reason not in _GOAL_NOT_DONE_STOP_REASONS:
+            self._mark_goal_done(registered_goal)
         return result
 
     def _run_prompt(
@@ -441,6 +659,25 @@ class LocalCodingAgent:
             effective_prompt,
             resumed=base_session is not None,
         )
+
+        # 2026-04-27: pre-prompt router re-wired after session-refactor removed it.
+        # Module at ~/.latti/lib/pre_prompt_router.py — pure-python port of pi's 4
+        # prompt-reactive extensions (research-before-build, skill-router,
+        # harness-router, depth-reasoner). Gated by LATTI_PROMPT_ROUTER env var
+        # (default 1 in shim). Failures must never break the model call.
+        if os.environ.get("LATTI_PROMPT_ROUTER", "0") == "1":
+            try:
+                import sys as _sys
+                _latti_lib = os.path.expanduser("~/.latti/lib")
+                if _latti_lib not in _sys.path:
+                    _sys.path.insert(0, _latti_lib)
+                from pre_prompt_router import route_prompt, format_injections  # type: ignore
+                _injections = route_prompt(effective_prompt)
+                if _injections:
+                    _block = format_injections(_injections)
+                    effective_prompt = f"{effective_prompt}\n\n{_block}"
+            except Exception:
+                pass
         self.managed_agent_id = self.agent_manager.start_agent(
             prompt=effective_prompt,
             parent_agent_id=self.parent_agent_id,
@@ -490,8 +727,9 @@ class LocalCodingAgent:
         total_usage = starting_usage
         total_cost_usd = starting_cost_usd
         file_history = list(existing_file_history)
-        stream_events: list[dict[str, object]] = []
+        stream_events: list[dict[str, object]] = self._new_stream_events()
         assistant_response_segments: list[str] = []
+        consecutive_empty_responses = 0
         delegated_tasks = sum(
             1 for entry in file_history if entry.get('action') in ('delegate_agent', 'Agent')
         )
@@ -524,7 +762,30 @@ class LocalCodingAgent:
             self.last_run_result = result
             return result
 
-        for turn_index in range(1, self.runtime_config.max_turns + 1):
+        if self._should_use_state_machine_outer_loop():
+            result = self._run_prompt_via_state_machine_outer_loop(
+                effective_prompt=effective_prompt,
+                session=session,
+                session_id=session_id,
+                scratchpad_directory=scratchpad_directory,
+                tool_specs=tool_specs,
+                starting_usage=starting_usage,
+                starting_cost_usd=starting_cost_usd,
+                starting_tool_calls=starting_tool_calls,
+                starting_session_turns=starting_session_turns,
+                starting_model_calls=starting_model_calls,
+                delegated_tasks=delegated_tasks,
+                file_history=file_history,
+                stream_events=stream_events,
+            )
+            self.last_run_result = result
+            return result
+
+        # 2026-04-27: Remove max_turns ceiling from main loop.
+        # The loop is bounded by explicit break/return conditions (budget,
+        # empty responses, tool errors, etc.), not by a hardcoded turn count.
+        # Removing the ceiling allows long autonomous work to proceed.
+        for turn_index in itertools.count(1):
             self._microcompact_session_if_needed(
                 session,
                 stream_events,
@@ -761,6 +1022,34 @@ class LocalCodingAgent:
                 self.last_run_result = result
                 return result
 
+            # Track consecutive empty responses — stop burning money on nothing
+            if not turn.content.strip() and not turn.tool_calls:
+                consecutive_empty_responses += 1
+            else:
+                consecutive_empty_responses = 0
+            if consecutive_empty_responses >= 3:
+                result = AgentRunResult(
+                    final_output=(
+                        'Stopped: model returned 3 consecutive empty responses. '
+                        'This usually means the input is not a valid prompt.'
+                    ),
+                    turns=turn_index,
+                    tool_calls=tool_calls,
+                    transcript=session.transcript(),
+                    events=tuple(stream_events),
+                    usage=total_usage,
+                    total_cost_usd=total_cost_usd,
+                    stop_reason='empty_responses',
+                    file_history=tuple(file_history),
+                    session_id=session_id,
+                    scratchpad_directory=(
+                        str(scratchpad_directory) if scratchpad_directory is not None else None
+                    ),
+                )
+                result = self._persist_session(session, result)
+                self.last_run_result = result
+                return result
+
             if not turn.tool_calls:
                 assistant_response_segments.append(turn.content)
                 if self._should_continue_response(turn):
@@ -781,8 +1070,13 @@ class LocalCodingAgent:
                     )
                     last_content = ''.join(assistant_response_segments)
                     continue
+                final_output = ''.join(assistant_response_segments)
+                final_output = apply_response_gate(
+                    final_output,
+                    bypass=os.environ.get('LATTI_GATE', '1') == '0',
+                )
                 result = AgentRunResult(
-                    final_output=''.join(assistant_response_segments),
+                    final_output=final_output,
                     turns=turn_index,
                     tool_calls=tool_calls,
                     transcript=session.transcript(),
@@ -940,13 +1234,32 @@ class LocalCodingAgent:
                             'message': policy_block_message,
                         }
                     )
+                # TUI: show tool call
+                from . import tui as _tui
+                _tool_detail = self._tool_call_detail(tool_call)
+                _tui.tool_start(tool_call.name, _tool_detail)
+
                 if tool_call.name in ('Agent', 'delegate_agent'):
                     if tool_result is None:
                         tool_result = self._execute_delegate_agent(tool_call.arguments)
                 elif tool_call.name == 'Skill':
                     if tool_result is None:
                         tool_result = self._execute_skill(tool_call.arguments)
+                elif tool_result is None and os.environ.get('LATTI_USE_STATE_MACHINE') != '0':
+                    # State-machine bridge is the PRIMARY path (Step 6, 2026-04-29).
+                    # The typed loop replaces the legacy execute_tool_streaming
+                    # block; legacy is a fallback reachable via LATTI_USE_STATE_MACHINE=0.
+                    # Verified live: branch reaches dispatch, policy_decisions appends.
+                    tool_result = self._dispatch_via_state_machine(
+                        tool_call,
+                        session=session,
+                        tool_message_index=tool_message_index,
+                        stream_events=stream_events,
+                    )
                 elif tool_result is None:
+                    # Legacy fallback — only reached when LATTI_USE_STATE_MACHINE=0.
+                    # Will be removed once the typed loop has soaked across all
+                    # tool kinds in production.
                     for update in execute_tool_streaming(
                         self.tool_registry,
                         tool_call.name,
@@ -973,6 +1286,29 @@ class LocalCodingAgent:
                         tool_result = update.result
                 if tool_result is None:
                     raise RuntimeError(f'Tool executor returned no final result for {tool_call.name}')
+                # TUI: show tool result
+                if tool_result.ok:
+                    _content = tool_result.content or 'ok'
+                    # Sanitize tool output before display — strips layout-busting
+                    # escape sequences (scroll-region-reset, screen-clear, cursor
+                    # movement, RIS, alt-screen) that subprocess output can contain.
+                    try:
+                        from .tui_heal import sanitize as _tui_sanitize
+                        _content = _tui_sanitize(_content)
+                    except Exception:
+                        pass
+                    # Show first line only, max 100 chars
+                    _first_line = _content.split('\n')[0]
+                    _summary = _first_line[:100] + '...' if len(_first_line) > 100 else _first_line
+                    _tui.tool_result(tool_call.name, _summary)
+                else:
+                    _err = tool_result.content or 'error'
+                    try:
+                        from .tui_heal import sanitize as _tui_sanitize
+                        _err = _tui_sanitize(_err)
+                    except Exception:
+                        pass
+                    _tui.tool_error(tool_call.name, _err)
                 if self.plugin_runtime is not None:
                     self.plugin_runtime.record_tool_result(
                         tool_call.name,
@@ -1145,16 +1481,805 @@ class LocalCodingAgent:
         self.last_run_result = result
         return result
 
+    def _should_use_state_machine_outer_loop(self) -> bool:
+        return (
+            os.environ.get('LATTI_USE_STATE_MACHINE') != '0'
+            and os.environ.get('LATTI_USE_LEGACY_LOOP') != '1'
+        )
+
+    def _new_stream_events(self) -> list[dict[str, object]]:
+        if self.runtime_event_sink is None:
+            return []
+        return _ObservableEventList(self.runtime_event_sink)
+
+    def _emit_runtime_event(self, event: dict[str, object]) -> None:
+        if self.runtime_event_sink is None:
+            return
+        try:
+            self.runtime_event_sink(dict(event))
+        except Exception:
+            pass
+
+    def _build_state_machine_llm_action_payload(
+        self,
+        session: AgentSessionState,
+        tool_specs: list[dict[str, object]],
+    ) -> dict[str, object]:
+        return {
+            'messages': session.to_openai_messages(),
+            'tools': tool_specs,
+            'output_schema': self.runtime_config.output_schema,
+            'model_override': self._route_model(session),
+        }
+
+    def _runtime_tool_queue_payload(
+        self,
+        pending_tool_calls: list[ToolCall],
+    ) -> list[dict[str, object]]:
+        return [
+            {
+                'id': tool_call.id,
+                'name': tool_call.name,
+                'arguments': dict(tool_call.arguments or {}),
+            }
+            for tool_call in pending_tool_calls
+        ]
+
+    def _run_prompt_via_state_machine_outer_loop(
+        self,
+        *,
+        effective_prompt: str,
+        session: AgentSessionState,
+        session_id: str,
+        scratchpad_directory: Path | None,
+        tool_specs: list[dict[str, object]],
+        starting_usage: UsageStats,
+        starting_cost_usd: float,
+        starting_tool_calls: int,
+        starting_session_turns: int,
+        starting_model_calls: int,
+        delegated_tasks: int,
+        file_history: list[dict[str, object]],
+        stream_events: list[dict[str, object]],
+    ) -> AgentRunResult:
+        from .state_machine_controllers import RuntimeLoopController
+
+        self._bind_state_machine_session(session_id)
+        controller = RuntimeLoopController()
+        total_usage = starting_usage
+        total_cost_usd = starting_cost_usd
+        tool_calls = starting_tool_calls
+        model_calls = starting_model_calls
+        last_content = ''
+        assistant_response_segments: list[str] = []
+        consecutive_empty_responses = 0
+        pending_tool_calls: list[ToolCall] = []
+        awaiting_model = True
+
+        for turn_index in itertools.count(1):
+            self._snip_session_if_needed(
+                session,
+                stream_events,
+                turn_index=turn_index,
+            )
+            self._compact_session_if_needed(
+                session,
+                stream_events,
+                turn_index=turn_index,
+            )
+            preflight = self._preflight_prompt_length(
+                session,
+                stream_events,
+                turn_index=turn_index,
+            )
+            if preflight.usage_increment.total_tokens or preflight.model_calls_increment:
+                total_usage = total_usage + preflight.usage_increment
+                total_cost_usd = self.model_config.pricing.estimate_cost_usd(total_usage)
+                model_calls += preflight.model_calls_increment
+                budget_after_preflight = self._check_budget(
+                    total_usage,
+                    total_cost_usd,
+                    tool_calls=tool_calls,
+                    delegated_tasks=delegated_tasks,
+                    model_calls=model_calls,
+                    session_turns=starting_session_turns + turn_index,
+                )
+                if budget_after_preflight.exceeded:
+                    result = AgentRunResult(
+                        final_output=(
+                            budget_after_preflight.reason
+                            or 'Stopped because the runtime budget was exceeded.'
+                        ),
+                        turns=turn_index,
+                        tool_calls=tool_calls,
+                        transcript=session.transcript(),
+                        events=tuple(stream_events),
+                        usage=total_usage,
+                        total_cost_usd=total_cost_usd,
+                        stop_reason='budget_exceeded',
+                        file_history=tuple(file_history),
+                        session_id=session_id,
+                        scratchpad_directory=(
+                            str(scratchpad_directory) if scratchpad_directory is not None else None
+                        ),
+                    )
+                    return self._persist_session(session, result)
+            if preflight.stop_reason is not None:
+                result = AgentRunResult(
+                    final_output=preflight.reason or 'Stopped before the next model call.',
+                    turns=max(turn_index - 1, 0),
+                    tool_calls=tool_calls,
+                    transcript=session.transcript(),
+                    events=tuple(stream_events),
+                    usage=total_usage,
+                    total_cost_usd=total_cost_usd,
+                    stop_reason=preflight.stop_reason,
+                    file_history=tuple(file_history),
+                    session_id=session_id,
+                    scratchpad_directory=(
+                        str(scratchpad_directory) if scratchpad_directory is not None else None
+                    ),
+                )
+                result = self._append_runtime_after_turn_events(
+                    result,
+                    prompt=effective_prompt,
+                    turn_index=max(turn_index - 1, 0),
+                )
+                return self._persist_session(session, result)
+
+            while True:
+                runtime_context = {
+                    'awaiting_model': awaiting_model,
+                    'pending_tool_calls': self._runtime_tool_queue_payload(pending_tool_calls),
+                    'next_llm_action': self._build_state_machine_llm_action_payload(
+                        session,
+                        tool_specs,
+                    ),
+                }
+                if self._sm_state is not None:
+                    # MERGE not REPLACE: last_verdict/last_error_text are threaded
+                    # by _evaluate_state_after_step on every step. with_runtime
+                    # used to wipe the dict each loop iteration, defeating the
+                    # verdict-driven controller behavior.
+                    merged_runtime = (
+                        dict(self._sm_state.runtime)
+                        if isinstance(self._sm_state.runtime, dict)
+                        else {}
+                    )
+                    merged_runtime.update(runtime_context)
+                    self._sm_state = self._sm_state.with_runtime(merged_runtime)
+                decision = controller.pick(self._sm_state)
+                if decision is None:
+                    result = AgentRunResult(
+                        final_output=(
+                            last_content
+                            or 'Stopped: runtime controller halted without a final answer.'
+                        ),
+                        turns=turn_index,
+                        tool_calls=tool_calls,
+                        transcript=session.transcript(),
+                        events=tuple(stream_events),
+                        usage=total_usage,
+                        total_cost_usd=total_cost_usd,
+                        stop_reason='controller_halt',
+                        file_history=tuple(file_history),
+                        session_id=session_id,
+                        scratchpad_directory=(
+                            str(scratchpad_directory) if scratchpad_directory is not None else None
+                        ),
+                    )
+                    result = self._append_runtime_after_turn_events(
+                        result,
+                        prompt=effective_prompt,
+                        turn_index=turn_index,
+                    )
+                    return self._persist_session(session, result)
+
+                action = decision.chose
+                stream_events.append(
+                    {
+                        'type': 'state_machine_decision',
+                        'turn_index': turn_index,
+                        'state_turn_id': decision.at_state_turn_id,
+                        'action_kind': action.kind,
+                        'rationale': decision.rationale,
+                        'decided_by': decision.decided_by,
+                        'confidence': decision.confidence,
+                    }
+                )
+
+                if action.kind == 'llm_call':
+                    model_override = (
+                        action.payload.get('model_override')
+                        if isinstance(action.payload.get('model_override'), str)
+                        else None
+                    )
+                    try:
+                        turn, turn_events = self._query_model_via_state_machine(
+                            session,
+                            tool_specs,
+                            model_override=model_override,
+                            action=action,
+                            rationale=decision.rationale,
+                            decided_by=decision.decided_by,
+                        )
+                    except OpenAICompatError as exc:
+                        if self._is_prompt_too_long_error(exc) and self._reactive_compact_session(
+                            session,
+                            stream_events,
+                            turn_index=turn_index,
+                        ):
+                            continue
+                        result = AgentRunResult(
+                            final_output=str(exc),
+                            turns=max(turn_index - 1, 0),
+                            tool_calls=tool_calls,
+                            transcript=session.transcript(),
+                            events=tuple(stream_events),
+                            usage=total_usage,
+                            total_cost_usd=total_cost_usd,
+                            stop_reason='backend_error',
+                            file_history=tuple(file_history),
+                            session_id=session_id,
+                            scratchpad_directory=(
+                                str(scratchpad_directory) if scratchpad_directory is not None else None
+                            ),
+                        )
+                        result = self._append_runtime_after_turn_events(
+                            result,
+                            prompt=effective_prompt,
+                            turn_index=turn_index,
+                        )
+                        return self._persist_session(session, result)
+
+                    stream_events.extend(event.to_dict() for event in turn_events)
+                    # Drain any per-tool eval events stashed since last LLM
+                    # step (so multi-tool 'replan' verdicts survive), then
+                    # emit fresh eval against current state.
+                    if self._pending_eval_events:
+                        stream_events.extend(self._pending_eval_events)
+                        self._pending_eval_events.clear()
+                    stream_events.extend(self._evaluate_state_after_step())
+                    model_calls += 1
+                    total_usage = total_usage + turn.usage
+                    total_cost_usd = self.model_config.pricing.estimate_cost_usd(total_usage)
+                    last_content = turn.content
+
+                    budget_after_model = self._check_budget(
+                        total_usage,
+                        total_cost_usd,
+                        tool_calls=tool_calls,
+                        delegated_tasks=delegated_tasks,
+                        model_calls=model_calls,
+                        session_turns=starting_session_turns + turn_index,
+                    )
+                    if budget_after_model.exceeded:
+                        result = AgentRunResult(
+                            final_output=(
+                                budget_after_model.reason
+                                or 'Stopped because the runtime budget was exceeded.'
+                            ),
+                            turns=turn_index,
+                            tool_calls=tool_calls,
+                            transcript=session.transcript(),
+                            events=tuple(stream_events),
+                            usage=total_usage,
+                            total_cost_usd=total_cost_usd,
+                            stop_reason='budget_exceeded',
+                            file_history=tuple(file_history),
+                            session_id=session_id,
+                            scratchpad_directory=(
+                                str(scratchpad_directory) if scratchpad_directory is not None else None
+                            ),
+                        )
+                        return self._persist_session(session, result)
+
+                    if not turn.content.strip() and not turn.tool_calls:
+                        consecutive_empty_responses += 1
+                    else:
+                        consecutive_empty_responses = 0
+                    if consecutive_empty_responses >= 3:
+                        result = AgentRunResult(
+                            final_output=(
+                                'Stopped: model returned 3 consecutive empty responses. '
+                                'This usually means the input is not a valid prompt.'
+                            ),
+                            turns=turn_index,
+                            tool_calls=tool_calls,
+                            transcript=session.transcript(),
+                            events=tuple(stream_events),
+                            usage=total_usage,
+                            total_cost_usd=total_cost_usd,
+                            stop_reason='empty_responses',
+                            file_history=tuple(file_history),
+                            session_id=session_id,
+                            scratchpad_directory=(
+                                str(scratchpad_directory) if scratchpad_directory is not None else None
+                            ),
+                        )
+                        return self._persist_session(session, result)
+
+                    if not turn.tool_calls:
+                        assistant_response_segments.append(turn.content)
+                        if self._should_continue_response(turn):
+                            session.append_user(
+                                self._build_continuation_prompt(),
+                                metadata={
+                                    'kind': 'continuation_request',
+                                    'continuation_index': len(assistant_response_segments),
+                                },
+                                message_id=f'continuation_{turn_index}',
+                            )
+                            stream_events.append(
+                                {
+                                    'type': 'continuation_request',
+                                    'reason': turn.finish_reason,
+                                    'continuation_index': len(assistant_response_segments),
+                                }
+                            )
+                            last_content = ''.join(assistant_response_segments)
+                            awaiting_model = True
+                            pending_tool_calls = []
+                            break
+                        final_output = ''.join(assistant_response_segments)
+                        final_output = apply_response_gate(
+                            final_output,
+                            bypass=os.environ.get('LATTI_GATE', '1') == '0',
+                        )
+                        result = AgentRunResult(
+                            final_output=final_output,
+                            turns=turn_index,
+                            tool_calls=tool_calls,
+                            transcript=session.transcript(),
+                            events=tuple(stream_events),
+                            usage=total_usage,
+                            total_cost_usd=total_cost_usd,
+                            stop_reason=turn.finish_reason,
+                            file_history=tuple(file_history),
+                            session_id=session_id,
+                            scratchpad_directory=(
+                                str(scratchpad_directory) if scratchpad_directory is not None else None
+                            ),
+                        )
+                        result = self._append_runtime_after_turn_events(
+                            result,
+                            prompt=effective_prompt,
+                            turn_index=turn_index,
+                        )
+                        return self._persist_session(session, result)
+
+                    pending_tool_calls = list(turn.tool_calls)
+                    awaiting_model = False
+                    continue
+
+                if action.kind != 'tool_call':
+                    result = AgentRunResult(
+                        final_output=f'Unsupported state-machine action kind: {action.kind}',
+                        turns=turn_index,
+                        tool_calls=tool_calls,
+                        transcript=session.transcript(),
+                        events=tuple(stream_events),
+                        usage=total_usage,
+                        total_cost_usd=total_cost_usd,
+                        stop_reason='unsupported_action',
+                        file_history=tuple(file_history),
+                        session_id=session_id,
+                        scratchpad_directory=(
+                            str(scratchpad_directory) if scratchpad_directory is not None else None
+                        ),
+                    )
+                    return self._persist_session(session, result)
+
+                if not pending_tool_calls:
+                    awaiting_model = True
+                    continue
+
+                tool_call = pending_tool_calls.pop(0)
+                assistant_response_segments.clear()
+                tool_calls += 1
+                if tool_call.name == 'delegate_agent':
+                    delegated_tasks += self._delegated_task_units(tool_call.arguments)
+                budget_after_tool_request = self._check_budget(
+                    total_usage,
+                    total_cost_usd,
+                    tool_calls=tool_calls,
+                    delegated_tasks=delegated_tasks,
+                    model_calls=model_calls,
+                    session_turns=starting_session_turns + turn_index,
+                )
+                if budget_after_tool_request.exceeded:
+                    stream_events.append(
+                        {
+                            'type': 'task_budget_exceeded',
+                            'turn_index': turn_index,
+                            'tool_name': tool_call.name,
+                            'tool_call_id': tool_call.id,
+                            'reason': budget_after_tool_request.reason,
+                        }
+                    )
+                    result = AgentRunResult(
+                        final_output=(
+                            budget_after_tool_request.reason
+                            or 'Stopped because the runtime budget was exceeded.'
+                        ),
+                        turns=turn_index,
+                        tool_calls=tool_calls,
+                        transcript=session.transcript(),
+                        events=tuple(stream_events),
+                        usage=total_usage,
+                        total_cost_usd=total_cost_usd,
+                        stop_reason='budget_exceeded',
+                        file_history=tuple(file_history),
+                        session_id=session_id,
+                        scratchpad_directory=(
+                            str(scratchpad_directory) if scratchpad_directory is not None else None
+                        ),
+                    )
+                    return self._persist_session(session, result)
+
+                tool_result = None
+                tool_message_index = session.start_tool(
+                    name=tool_call.name,
+                    tool_call_id=tool_call.id,
+                    message_id=f'tool_{len(session.messages)}',
+                    metadata={'phase': 'starting'},
+                )
+                stream_events.append(
+                    {
+                        'type': 'tool_start',
+                        'tool_name': tool_call.name,
+                        'tool_call_id': tool_call.id,
+                        'message_id': session.messages[tool_message_index].message_id,
+                    }
+                )
+                if self.plugin_runtime is not None:
+                    self.plugin_runtime.record_tool_attempt(tool_call.name, blocked=False)
+                plugin_preflight_messages = self._plugin_tool_preflight_messages(tool_call.name)
+                policy_preflight_messages = self._hook_policy_tool_preflight_messages(
+                    tool_call.name
+                )
+                if plugin_preflight_messages:
+                    stream_events.append(
+                        {
+                            'type': 'plugin_tool_preflight',
+                            'tool_name': tool_call.name,
+                            'tool_call_id': tool_call.id,
+                            'message_id': session.messages[tool_message_index].message_id,
+                            'message_count': len(plugin_preflight_messages),
+                        }
+                    )
+                if policy_preflight_messages:
+                    stream_events.append(
+                        {
+                            'type': 'hook_policy_tool_preflight',
+                            'tool_name': tool_call.name,
+                            'tool_call_id': tool_call.id,
+                            'message_id': session.messages[tool_message_index].message_id,
+                            'message_count': len(policy_preflight_messages),
+                        }
+                    )
+                plugin_block_message = self._plugin_block_message(tool_call.name)
+                policy_block_message = self._hook_policy_block_message(tool_call.name)
+                if plugin_block_message is not None:
+                    if self.plugin_runtime is not None:
+                        blocked_attempts = int(
+                            self.plugin_runtime.session_state.get('blocked_tool_attempts', 0)
+                        )
+                        self.plugin_runtime.session_state['blocked_tool_attempts'] = (
+                            blocked_attempts + 1
+                        )
+                    tool_result = ToolExecutionResult(
+                        name=tool_call.name,
+                        ok=False,
+                        content=plugin_block_message,
+                        metadata={
+                            'action': 'plugin_block',
+                            'plugin_blocked': True,
+                            'plugin_block_message': plugin_block_message,
+                        },
+                    )
+                    stream_events.append(
+                        {
+                            'type': 'plugin_tool_block',
+                            'tool_name': tool_call.name,
+                            'tool_call_id': tool_call.id,
+                            'message_id': session.messages[tool_message_index].message_id,
+                            'message': plugin_block_message,
+                        }
+                    )
+                if policy_block_message is not None:
+                    tool_result = ToolExecutionResult(
+                        name=tool_call.name,
+                        ok=False,
+                        content=policy_block_message,
+                        metadata={
+                            'action': 'hook_policy_block',
+                            'hook_policy_blocked': True,
+                            'hook_policy_block_message': policy_block_message,
+                            'error_kind': 'permission_denied',
+                        },
+                    )
+                    stream_events.append(
+                        {
+                            'type': 'hook_policy_tool_block',
+                            'tool_name': tool_call.name,
+                            'tool_call_id': tool_call.id,
+                            'message_id': session.messages[tool_message_index].message_id,
+                            'message': policy_block_message,
+                        }
+                    )
+                from . import tui as _tui
+                _tool_detail = self._tool_call_detail(tool_call)
+                _tui.tool_start(tool_call.name, _tool_detail)
+
+                if tool_result is None:
+                    tool_result = self._dispatch_via_state_machine(
+                        tool_call,
+                        session=session,
+                        tool_message_index=tool_message_index,
+                        stream_events=stream_events,
+                        rationale=decision.rationale,
+                        decided_by=decision.decided_by,
+                    )
+                if tool_result is None:
+                    raise RuntimeError(
+                        f'Tool executor returned no final result for {tool_call.name}'
+                    )
+                if tool_result.ok:
+                    _content = tool_result.content or 'ok'
+                    try:
+                        from .tui_heal import sanitize as _tui_sanitize
+                        _content = _tui_sanitize(_content)
+                    except Exception:
+                        pass
+                    _first_line = _content.split('\n')[0]
+                    _summary = _first_line[:100] + '...' if len(_first_line) > 100 else _first_line
+                    _tui.tool_result(tool_call.name, _summary)
+                else:
+                    _err = tool_result.content or 'error'
+                    try:
+                        from .tui_heal import sanitize as _tui_sanitize
+                        _err = _tui_sanitize(_err)
+                    except Exception:
+                        pass
+                    _tui.tool_error(tool_call.name, _err)
+                if self.plugin_runtime is not None:
+                    self.plugin_runtime.record_tool_result(
+                        tool_call.name,
+                        ok=tool_result.ok,
+                        metadata=tool_result.metadata,
+                    )
+                plugin_messages = self._plugin_tool_result_messages(tool_call.name)
+                policy_messages = self._hook_policy_tool_result_messages(tool_call.name)
+                if plugin_messages:
+                    merged_metadata = dict(tool_result.metadata)
+                    merged_metadata['plugin_messages'] = list(plugin_messages)
+                    tool_result = ToolExecutionResult(
+                        name=tool_result.name,
+                        ok=tool_result.ok,
+                        content=tool_result.content,
+                        metadata=merged_metadata,
+                    )
+                    for message in plugin_messages:
+                        stream_events.append(
+                            {
+                                'type': 'plugin_tool_hook',
+                                'tool_name': tool_call.name,
+                                'tool_call_id': tool_call.id,
+                                'message_id': session.messages[tool_message_index].message_id,
+                                'message': message,
+                            }
+                        )
+                if policy_messages:
+                    merged_metadata = dict(tool_result.metadata)
+                    merged_metadata['hook_policy_messages'] = list(policy_messages)
+                    tool_result = ToolExecutionResult(
+                        name=tool_result.name,
+                        ok=tool_result.ok,
+                        content=tool_result.content,
+                        metadata=merged_metadata,
+                    )
+                    for message in policy_messages:
+                        stream_events.append(
+                            {
+                                'type': 'hook_policy_tool_hook',
+                                'tool_name': tool_call.name,
+                                'tool_call_id': tool_call.id,
+                                'message_id': session.messages[tool_message_index].message_id,
+                                'message': message,
+                            }
+                        )
+                if tool_result.metadata.get('error_kind') == 'permission_denied':
+                    stream_events.append(
+                        {
+                            'type': 'tool_permission_denial',
+                            'tool_name': tool_call.name,
+                            'tool_call_id': tool_call.id,
+                            'message_id': session.messages[tool_message_index].message_id,
+                            'reason': tool_result.content,
+                            'source': (
+                                'hook_policy'
+                                if tool_result.metadata.get('action') == 'hook_policy_block'
+                                else 'tool_runtime'
+                            ),
+                        }
+                    )
+                session.finalize_tool(
+                    tool_message_index,
+                    content=serialize_tool_result(tool_result),
+                    metadata={
+                        'phase': 'completed',
+                        'plugin_preflight_messages': list(plugin_preflight_messages),
+                        'hook_policy_preflight_messages': list(policy_preflight_messages),
+                        **dict(tool_result.metadata),
+                    },
+                    stop_reason='tool_completed',
+                )
+                stream_events.append(
+                    {
+                        'type': 'tool_result',
+                        'tool_name': tool_call.name,
+                        'tool_call_id': tool_call.id,
+                        'message_id': session.messages[tool_message_index].message_id,
+                        'ok': tool_result.ok,
+                        'metadata': dict(tool_result.metadata),
+                    }
+                )
+                self._append_runtime_tool_followup_events(
+                    stream_events,
+                    tool_call=tool_call,
+                    tool_result=tool_result,
+                )
+                plugin_runtime_message = self._build_plugin_tool_runtime_message(
+                    tool_name=tool_call.name,
+                    preflight_messages=plugin_preflight_messages,
+                    block_message=plugin_block_message,
+                    plugin_messages=plugin_messages,
+                    hook_policy_preflight_messages=policy_preflight_messages,
+                    hook_policy_block_message=policy_block_message,
+                    hook_policy_messages=policy_messages,
+                    delegate_preflight_messages=tuple(
+                        message
+                        for message in tool_result.metadata.get(
+                            'plugin_delegate_preflight_messages',
+                            [],
+                        )
+                        if isinstance(message, str) and message
+                    ),
+                    delegate_after_messages=tuple(
+                        message
+                        for message in tool_result.metadata.get(
+                            'plugin_delegate_after_messages',
+                            [],
+                        )
+                        if isinstance(message, str) and message
+                    ),
+                )
+                if plugin_runtime_message is not None:
+                    session.append_user(
+                        plugin_runtime_message,
+                        metadata={
+                            'kind': 'plugin_tool_runtime',
+                            'tool_name': tool_call.name,
+                            'tool_call_id': tool_call.id,
+                            'plugin_blocked': plugin_block_message is not None,
+                            'plugin_message_count': len(plugin_messages),
+                            'plugin_preflight_count': len(plugin_preflight_messages),
+                        },
+                        message_id=f'plugin_tool_runtime_{tool_call.id}',
+                    )
+                    stream_events.append(
+                        {
+                            'type': 'plugin_tool_context',
+                            'tool_name': tool_call.name,
+                            'tool_call_id': tool_call.id,
+                            'message_id': f'plugin_tool_runtime_{tool_call.id}',
+                            'blocked': plugin_block_message is not None,
+                            'message_count': len(plugin_messages),
+                            'preflight_count': len(plugin_preflight_messages),
+                        }
+                    )
+                self._refresh_runtime_views_for_tool_result(tool_call.name, tool_result)
+                history_entry = self._build_file_history_entry(
+                    tool_call=tool_call,
+                    tool_result=tool_result,
+                    turn_index=turn_index,
+                )
+                if history_entry is not None:
+                    file_history.append(history_entry)
+
+                awaiting_model = not pending_tool_calls
+                if awaiting_model:
+                    break
+                continue
+
+    def _route_model(self, session: AgentSessionState) -> str | None:
+        """Use the model router and scars to pick the best model.
+
+        Returns a model override string, or None to use the default.
+
+        Scar routing takes priority when a successful past scar matches.
+        Lessons from all similar scars are injected into the system prompt
+        regardless of whether a model override fires, so the model always
+        has the benefit of past experience.
+        """
+        # Extract last user message for classification
+        last_user_msg = ''
+        for msg in reversed(session.messages):
+            if getattr(msg, 'role', None) == 'user':
+                last_user_msg = getattr(msg, 'content', '') or ''
+                break
+
+        # Check scars — always inject lessons, optionally override model
+        if self.scar_router is not None and last_user_msg:
+            scar_decision = self.scar_router.route_problem(last_user_msg)
+
+            # Inject lessons into the live session system prompt so the model
+            # sees past experience as part of its context, not just routing.
+            lessons = scar_decision.get('lessons_context', '')
+            if lessons:
+                self._inject_scar_lessons(session, lessons)
+
+            # Only override the model when we have a confident scar match
+            # (a successful past scar, not just any similar scar).
+            if scar_decision.get('scar_matched') and scar_decision.get('model'):
+                _tui.scar_match(
+                    scar_id=scar_decision['scar_matched'],
+                    lesson=scar_decision['lesson'],
+                    model=scar_decision['model'],
+                )
+                return scar_decision['model']
+
+        # Fall back to model router
+        if self.model_router is None or not self.model_router.config.enabled:
+            return None
+        decision = self.model_router.classify_turn(last_user_msg)
+        if decision.tier.value != 'heavy':
+            return decision.model
+        return None
+
+    def _inject_scar_lessons(
+        self,
+        session: AgentSessionState,
+        lessons: str,
+    ) -> None:
+        """Append scar lessons to the last system prompt part in the session.
+
+        This is best-effort: if the session structure doesn't support it,
+        we silently skip rather than crashing the run.
+        """
+        try:
+            if not hasattr(session, 'system_prompt_parts'):
+                return
+            parts = list(session.system_prompt_parts)
+            if not parts:
+                return
+            # Append to the last part so it appears near the end of the
+            # system prompt, close to the dynamic boundary.
+            parts[-1] = parts[-1] + f'\n\n{lessons}'
+            # AgentSessionState is frozen; use replace() to update
+            object.__setattr__(session, 'system_prompt_parts', tuple(parts))
+        except Exception:
+            pass  # Best-effort; never disrupt the run
+
     def _query_model(
         self,
         session: AgentSessionState,
         tool_specs: list[dict[str, object]],
     ) -> tuple[AssistantTurn, tuple[StreamEvent, ...]]:
+        model_override = self._route_model(session)
+        if os.environ.get('LATTI_USE_STATE_MACHINE') != '0':
+            return self._query_model_via_state_machine(
+                session,
+                tool_specs,
+                model_override=model_override,
+            )
         if not self.runtime_config.stream_model_responses:
             turn = self.client.complete(
                 session.to_openai_messages(),
                 tool_specs,
                 output_schema=self.runtime_config.output_schema,
+                model_override=model_override,
             )
             assistant_tool_calls = tuple(
                 {
@@ -1177,6 +2302,9 @@ class LocalCodingAgent:
                 stop_reason=turn.finish_reason,
                 usage=turn.usage,
             )
+            # Display thinking if present (o1/o3 models)
+            if turn.thinking:
+                _tui.thinking_block(turn.thinking, token_count=turn.usage.reasoning_tokens or 0)
             return turn, ()
 
         assistant_index = session.start_assistant(
@@ -1185,14 +2313,27 @@ class LocalCodingAgent:
         usage = UsageStats()
         finish_reason: str | None = None
         events: list[StreamEvent] = []
+        thinking_text = ''
+
+        # TUI stream renderer for formatted output
+        from . import tui as _tui
+        renderer = _tui.StreamRenderer()
+        renderer.start()
+        has_content = False
+
         for event in self.client.stream(
             session.to_openai_messages(),
             tool_specs,
             output_schema=self.runtime_config.output_schema,
+            model_override=model_override,
         ):
             events.append(event)
-            if event.type == 'content_delta':
+            if event.type == 'thinking_delta':
+                thinking_text += event.delta
+            elif event.type == 'content_delta':
                 session.append_assistant_delta(assistant_index, event.delta)
+                renderer.token(event.delta)
+                has_content = True
             elif event.type == 'tool_call_delta':
                 session.merge_assistant_tool_call_delta(
                     assistant_index,
@@ -1206,6 +2347,9 @@ class LocalCodingAgent:
             elif event.type == 'message_stop':
                 finish_reason = event.finish_reason
 
+        if has_content:
+            renderer.end()
+
         session.finalize_assistant(
             assistant_index,
             finish_reason=finish_reason,
@@ -1218,8 +2362,702 @@ class LocalCodingAgent:
             finish_reason=finish_reason,
             raw_message=assistant_message.to_openai_message(),
             usage=usage,
+            thinking=thinking_text,
         )
+        # Display thinking if present (o1/o3 models)
+        if thinking_text:
+            _tui.thinking_block(thinking_text, token_count=usage.reasoning_tokens or 0)
         return turn, tuple(events)
+
+    def _query_model_via_state_machine(
+        self,
+        session: AgentSessionState,
+        tool_specs: list[dict[str, object]],
+        *,
+        model_override: str | None,
+        action=None,
+        rationale: str = 'llm_call via state-machine',
+        decided_by: str = 'rule',
+    ) -> tuple[AssistantTurn, tuple[StreamEvent, ...]]:
+        from .agent_state_machine import Action
+        from .state_machine_operators import StreamingLLMOperator
+
+        runner = self._ensure_state_machine_runner()
+        self._bind_state_machine_session(self.active_session_id or 'sm_unknown')
+        if action is None:
+            action = Action(
+                kind='llm_call',
+                payload={
+                    'messages': session.to_openai_messages(),
+                    'tools': tool_specs,
+                    'output_schema': self.runtime_config.output_schema,
+                    'model_override': model_override,
+                },
+            )
+
+        if not self.runtime_config.stream_model_responses:
+            obs, new_state = runner.run_one_step(
+                self._sm_state,
+                action,
+                rationale=rationale,
+                decided_by=decided_by,
+            )
+            self._sm_state = new_state
+            self._maybe_save_scar(action, obs)
+            if obs.kind == 'error':
+                raise OpenAICompatError(str(obs.payload.get('error', 'state-machine llm_call failed')))
+
+            usage_payload = (
+                obs.payload.get('usage')
+                if isinstance(obs.payload.get('usage'), dict)
+                else {}
+            )
+            usage = usage_from_payload(usage_payload)
+            assistant_tool_calls = tuple(
+                {
+                    'id': tool_call.get('id'),
+                    'type': 'function',
+                    'function': {
+                        'name': tool_call.get('name'),
+                        'arguments': json.dumps(
+                            tool_call.get('arguments') or {},
+                            ensure_ascii=True,
+                        ),
+                    },
+                }
+                for tool_call in (obs.payload.get('tool_calls') or [])
+                if isinstance(tool_call, dict)
+            )
+            session.append_assistant(
+                str(obs.payload.get('content', '')),
+                assistant_tool_calls,
+                message_id=f'assistant_{len(session.messages)}',
+                stop_reason=(
+                    str(obs.payload.get('finish_reason'))
+                    if obs.payload.get('finish_reason') is not None
+                    else None
+                ),
+                usage=usage,
+            )
+            thinking_text = str(obs.payload.get('thinking') or '')
+            if thinking_text:
+                from . import tui as _tui
+                _tui.thinking_block(thinking_text, token_count=usage.reasoning_tokens or 0)
+            assistant_message = session.messages[-1]
+            return AssistantTurn(
+                content=assistant_message.content,
+                tool_calls=self._tool_calls_from_message(assistant_message.tool_calls),
+                finish_reason=assistant_message.stop_reason,
+                raw_message=assistant_message.to_openai_message(),
+                usage=usage,
+                thinking=thinking_text,
+            ), ()
+
+        assistant_index = session.start_assistant(
+            message_id=f'assistant_{len(session.messages)}'
+        )
+        usage = UsageStats()
+        finish_reason: str | None = None
+        events: list[StreamEvent] = []
+        thinking_text = ''
+        from . import tui as _tui
+        renderer = _tui.StreamRenderer()
+        renderer.start()
+        has_content = False
+
+        llm_op = next(
+            op for op in runner.operators if isinstance(op, StreamingLLMOperator)
+        )
+
+        def _event_callback(event: StreamEvent, _action) -> None:
+            nonlocal usage, finish_reason, thinking_text, has_content
+            events.append(event)
+            if event.type == 'thinking_delta':
+                thinking_text += event.delta
+            elif event.type == 'content_delta':
+                session.append_assistant_delta(assistant_index, event.delta)
+                renderer.token(event.delta)
+                has_content = True
+            elif event.type == 'tool_call_delta':
+                session.merge_assistant_tool_call_delta(
+                    assistant_index,
+                    tool_call_index=event.tool_call_index or 0,
+                    tool_call_id=event.tool_call_id,
+                    tool_name=event.tool_name,
+                    arguments_delta=event.arguments_delta,
+                )
+            elif event.type == 'usage':
+                usage = usage + event.usage
+            elif event.type == 'message_stop':
+                finish_reason = event.finish_reason
+
+        llm_op._event_callback = _event_callback
+        try:
+            obs, new_state = runner.run_one_step(
+                self._sm_state,
+                action,
+                rationale=rationale,
+                decided_by=decided_by,
+            )
+        finally:
+            llm_op._event_callback = None
+        self._sm_state = new_state
+        self._maybe_save_scar(action, obs)
+        if has_content:
+            renderer.end()
+        if obs.kind == 'error':
+            raise OpenAICompatError(str(obs.payload.get('error', 'state-machine llm stream failed')))
+
+        if usage.total_tokens == 0:
+            usage_payload = (
+                obs.payload.get('usage')
+                if isinstance(obs.payload.get('usage'), dict)
+                else {}
+            )
+            usage = usage_from_payload(usage_payload)
+        if finish_reason is None and obs.payload.get('finish_reason') is not None:
+            finish_reason = str(obs.payload.get('finish_reason'))
+        if not thinking_text:
+            thinking_text = str(obs.payload.get('thinking') or '')
+
+        session.finalize_assistant(
+            assistant_index,
+            finish_reason=finish_reason,
+            usage=usage,
+        )
+        assistant_message = session.messages[assistant_index]
+        turn = AssistantTurn(
+            content=assistant_message.content,
+            tool_calls=self._tool_calls_from_message(assistant_message.tool_calls),
+            finish_reason=finish_reason,
+            raw_message=assistant_message.to_openai_message(),
+            usage=usage,
+            thinking=thinking_text,
+        )
+        if thinking_text:
+            _tui.thinking_block(thinking_text, token_count=usage.reasoning_tokens or 0)
+        return turn, tuple(events)
+
+    def _ensure_state_machine_runner(self):
+        if self._sm_runner is not None:
+            return self._sm_runner
+        from .state_machine_operators import (
+            DelegateAgentOperator,
+            RealLLMOperator,
+            StreamingLLMOperator,
+            ToolCallOperator,
+        )
+        from .state_machine_runner import StateMachineRunner
+        from .state_machine_validators import (
+            AnchorViolationValidator,
+            NonEmptyContentValidator,
+            ObservationShapeValidator,
+        )
+        from .state_machine_evaluators import (
+            BudgetExhaustionEvaluator,
+            ConsecutiveErrorEvaluator,
+        )
+
+        llm_operator = (
+            StreamingLLMOperator(self.client)
+            if self.runtime_config.stream_model_responses
+            else RealLLMOperator(self.client)
+        )
+        # Anchor-violation validator (summary→active-constraint).
+        # Reads live anchored messages from the session each turn so
+        # mid-session NEVER: constraints are picked up without rebuild.
+        def _live_anchors() -> list[str]:
+            sess = self.last_session
+            if sess is None:
+                return []
+            return [
+                m.content for m in sess.messages
+                if isinstance(m.metadata, dict)
+                and m.metadata.get('anchor') is True
+                and isinstance(m.content, str)
+            ]
+        self._sm_runner = StateMachineRunner(
+            operators=[
+                llm_operator,
+                DelegateAgentOperator(self._execute_delegate_agent),
+                ToolCallOperator(self.tool_registry, self.tool_context),
+            ],
+            validators=[
+                ObservationShapeValidator(),
+                NonEmptyContentValidator(),
+                AnchorViolationValidator(anchors_provider=_live_anchors),
+            ],
+            # ConsecutiveErrorEvaluator returns 'replan' when last observation
+            # is an error; today this only feeds telemetry, but it makes
+            # error-driven control surfaces visible to the TUI.
+            # TaskCompletionEvaluator deliberately NOT wired until task
+            # decomposition lands in the production state path — without it
+            # the evaluator would emit 'done' on every successful step.
+            evaluators=[
+                BudgetExhaustionEvaluator(),
+                ConsecutiveErrorEvaluator(),
+            ],
+        )
+        return self._sm_runner
+
+    def _thread_eval_verdict_to_state(self, verdict: str) -> None:
+        """Write the verdict into _sm_state.runtime['last_verdict'] so the
+        next controller.pick() can read it via the existing runtime channel.
+
+        State is frozen so this constructs a new state via dataclasses.replace.
+        Controllers that don't read 'last_verdict' continue to work unchanged.
+
+        Always writes — including 'continue' — so verdict-driven controller
+        behavior is one-shot. If a 'replan' fires, drives a reminder
+        injection, and the next step succeeds, this overwrites with
+        'continue' and the turn after that does NOT re-inject the
+        reminder. (Pre-fix: 'continue' was filtered, so a single 'replan'
+        verdict would persist and re-inject every subsequent turn.)
+        """
+        if self._sm_state is None:
+            return
+        from dataclasses import replace as _dc_replace
+        current_runtime = (
+            dict(self._sm_state.runtime) if isinstance(self._sm_state.runtime, dict) else {}
+        )
+        current_runtime['last_verdict'] = verdict
+        self._sm_state = _dc_replace(self._sm_state, runtime=current_runtime)
+
+    def _evaluate_state_after_step(self) -> list[dict]:
+        """Run wired evaluators against current _sm_state, return telemetry events.
+
+        Side-effect: when an evaluator produces a non-'continue' verdict, threads
+        it into _sm_state.runtime['last_verdict'] so the next controller.pick()
+        can react. Threading is opt-in for controllers — silent no-op for those
+        that don't read runtime['last_verdict'].
+        """
+        if self._sm_runner is None or self._sm_state is None:
+            return []
+        try:
+            results = self._sm_runner.evaluate(self._sm_state, goal=None)
+        except Exception:
+            return []
+        # Pair results with evaluator names by index — runner.evaluate iterates
+        # evaluators in registration order, so result[i] corresponds to
+        # runner.evaluators[i].
+        evaluator_names: list[str] = []
+        for ev in self._sm_runner.evaluators:
+            try:
+                evaluator_names.append(ev.name)
+            except Exception:
+                evaluator_names.append(type(ev).__name__)
+        events: list[dict] = []
+        # Precedence for threading: 'escalate' > 'timeout' > 'done' > 'replan' > 'continue'.
+        # If multiple evaluators fire, the most-terminal verdict wins on the
+        # state.runtime channel. 'continue' is now also threaded so verdict-
+        # driven controller behavior (e.g. replan-injects-reminder) becomes
+        # one-shot — see _thread_eval_verdict_to_state docstring.
+        _PRECEDENCE = {'escalate': 4, 'timeout': 3, 'done': 2, 'replan': 1, 'continue': 0}
+        winning_verdict: str | None = None
+        winning_rank = -1
+        for i, r in enumerate(results):
+            name = evaluator_names[i] if i < len(evaluator_names) else 'unknown'
+            events.append({
+                'type': 'state_machine_evaluation',
+                'evaluator': name,
+                'verdict': r.verdict,
+                'score': r.score,
+                'note': r.note,
+                'dimensions': dict(r.dimensions),
+            })
+            rank = _PRECEDENCE.get(r.verdict, 0)
+            if rank > winning_rank:
+                winning_rank = rank
+                winning_verdict = r.verdict
+        if winning_verdict:
+            # Always thread the winning verdict — including 'continue' —
+            # so verdict-driven controller behavior is one-shot rather
+            # than persistent across turns.
+            self._thread_eval_verdict_to_state(winning_verdict)
+            # On 'replan', also surface the actual last-observation error
+            # text so the controller's reminder injection can be specific
+            # rather than generic. Cleared on subsequent non-error turns
+            # by the same one-shot mechanism.
+            if winning_verdict == 'replan' and self._sm_state is not None:
+                err_text = self._extract_last_error_text()
+                if err_text:
+                    self._thread_runtime_field('last_error_text', err_text)
+        return events
+
+    def _extract_last_error_text(self) -> str:
+        """Pull a human-readable error string out of the most recent
+        Observation when its kind=='error'. Returns empty string if no
+        observation, no error, or no readable error field.
+        """
+        if self._sm_state is None or self._sm_state.last_observation is None:
+            return ''
+        obs = self._sm_state.last_observation
+        if obs.kind != 'error':
+            return ''
+        payload = obs.payload if isinstance(obs.payload, dict) else {}
+        for key in ('error', 'message', 'reason', 'detail'):
+            v = payload.get(key)
+            if isinstance(v, str) and v.strip():
+                return v
+        return ''
+
+    def _thread_runtime_field(self, field_name: str, value: object) -> None:
+        """Write an arbitrary key into _sm_state.runtime via dataclass.replace."""
+        if self._sm_state is None:
+            return
+        from dataclasses import replace as _dc_replace
+        current_runtime = (
+            dict(self._sm_state.runtime) if isinstance(self._sm_state.runtime, dict) else {}
+        )
+        current_runtime[field_name] = value
+        self._sm_state = _dc_replace(self._sm_state, runtime=current_runtime)
+
+    def state_machine_memory(self):
+        """Lazy-construct and return a LattiMemoryStore for ~/.latti/memory.
+
+        Returns None when ~/.latti is unavailable. Used by code paths that
+        want to persist scars/SOPs/lessons via the typed MemoryRecord schema.
+        """
+        if self._sm_memory is not None:
+            return self._sm_memory
+        try:
+            from pathlib import Path as _P
+            from .state_machine_memory import LattiMemoryStore
+            path = _P.home() / '.latti' / 'memory'
+            self._sm_memory = LattiMemoryStore(path)
+        except Exception:
+            return None
+        return self._sm_memory
+
+    def state_machine_goals(self):
+        """Lazy-construct and return a GoalRegistry for ~/.latti/goals/."""
+        if self._sm_goals is not None:
+            return self._sm_goals
+        try:
+            from pathlib import Path as _P
+            from .state_machine_goals import GoalRegistry
+            self._sm_goals = GoalRegistry(_P.home() / '.latti' / 'goals')
+        except Exception:
+            return None
+        return self._sm_goals
+
+    def state_machine_tasks(self):
+        """Lazy-construct and return a TaskTracker for ~/.latti/goals/."""
+        if self._sm_tasks is not None:
+            return self._sm_tasks
+        try:
+            from pathlib import Path as _P
+            from .state_machine_goals import TaskTracker
+            self._sm_tasks = TaskTracker(_P.home() / '.latti' / 'goals')
+        except Exception:
+            return None
+        return self._sm_tasks
+
+    def _bind_state_machine_session(self, session_id: str) -> None:
+        """Ensure typed state is bound to the active session before the turn runs."""
+        if os.environ.get('LATTI_USE_STATE_MACHINE') == '0':
+            return
+
+        from .agent_state_machine import State
+
+        current_session_id = getattr(self._sm_state, 'session_id', None)
+        if self._sm_state is not None and current_session_id == session_id:
+            return
+
+        # Use the runtime_config's actual cost cap if set; otherwise treat
+        # as unlimited (float('inf')) so BudgetExhaustionEvaluator doesn't
+        # falsely fire 'timeout' on a fresh state with budget=0.0. The
+        # legacy budget check at agent_runtime.py:_check_budget remains the
+        # canonical exit; the evaluator is signal-only today.
+        cap = self.runtime_config.budget_config.max_total_cost_usd
+        budget_usd = cap if cap is not None else float('inf')
+        self._sm_state = State.fresh(
+            session_id=session_id,
+            budget_usd=budget_usd,
+            available_tools=tuple(self.tool_registry.keys()) if self.tool_registry else (),
+        )
+
+    def _restore_persisted_state_machine_state(
+        self,
+        stored_session: StoredAgentSession,
+    ) -> bool:
+        if os.environ.get('LATTI_USE_STATE_MACHINE') == '0':
+            return False
+        typed_state = (
+            stored_session.typed_state
+            if isinstance(getattr(stored_session, 'typed_state', None), dict)
+            else {}
+        )
+        if not typed_state:
+            return False
+        from .agent_state_machine import state_from_dict
+
+        restored = state_from_dict(typed_state)
+        if restored is None:
+            return False
+        if restored.session_id != stored_session.session_id:
+            restored = State(
+                turn_id=restored.turn_id,
+                session_id=stored_session.session_id,
+                beliefs=restored.beliefs,
+                open_tasks=restored.open_tasks,
+                available_tools=restored.available_tools,
+                runtime=restored.runtime,
+                budget_remaining_usd=restored.budget_remaining_usd,
+                last_observation=restored.last_observation,
+            )
+        self._sm_state = restored
+        return True
+
+    def _dispatch_via_state_machine(
+        self,
+        tool_call,
+        session=None,
+        tool_message_index: int | None = None,
+        stream_events: list | None = None,
+        rationale: str | None = None,
+        decided_by: str = 'rule',
+    ) -> 'ToolExecutionResult':
+        """State-machine dispatch path. Default-on since 2026-04-29 (Step 6).
+
+        Active when ``LATTI_USE_STATE_MACHINE != '0'`` (i.e. by default).
+        Routes a single tool call through StateMachineRunner using
+        ToolCallOperator, logs a PolicyDecision, and converts the resulting
+        Observation back to the ToolExecutionResult shape that downstream
+        code expects.
+
+        Streaming preservation: when ``session``, ``tool_message_index``, and
+        ``stream_events`` are passed, deltas are mirrored to the legacy
+        session/event surface in real time instead of batched. Without them
+        (e.g. in tests), deltas are still collected in observation.payload.
+        """
+        # Local imports keep flag-off path free of state-machine dependencies.
+        from .agent_state_machine import Action
+        from .state_machine_operators import ToolCallOperator
+        from .agent_types import ToolExecutionResult
+
+        self._ensure_state_machine_runner()
+        if self._sm_state is None:
+            self._bind_state_machine_session(self.active_session_id or 'sm_unknown')
+
+        # Wire delta callback for this dispatch only — mirrors the legacy
+        # streaming path so the TUI sees live deltas instead of batched output.
+        if session is not None and tool_message_index is not None and stream_events is not None:
+            def _on_delta(content: str, stream: 'str | None', _action) -> None:
+                session.append_tool_delta(
+                    tool_message_index, content,
+                    metadata={'last_stream': stream or 'tool'},
+                )
+                stream_events.append({
+                    'type': 'tool_delta',
+                    'tool_name': tool_call.name,
+                    'tool_call_id': tool_call.id,
+                    'message_id': session.messages[tool_message_index].message_id,
+                    'stream': stream,
+                    'delta': content,
+                })
+            for op in self._sm_runner.operators:
+                if isinstance(op, ToolCallOperator):
+                    op._delta_callback = _on_delta
+                    break
+        else:
+            # Reset callback on any pre-existing ToolCallOperator (clean state)
+            for op in self._sm_runner.operators:
+                if isinstance(op, ToolCallOperator):
+                    op._delta_callback = None
+                    break
+
+        action = Action(
+            kind='tool_call',
+            payload={
+                'tool_name': tool_call.name,
+                'arguments': dict(tool_call.arguments or {}),
+            },
+        )
+        try:
+            observation, new_state = self._sm_runner.run_one_step(
+                self._sm_state, action,
+                rationale=rationale or f'agent_runtime dispatch: {tool_call.name}',
+                decided_by=decided_by,
+            )
+        finally:
+            # Always clear the callback after dispatch — bounded state mutation.
+            for op in self._sm_runner.operators:
+                if isinstance(op, ToolCallOperator):
+                    op._delta_callback = None
+                    break
+        self._sm_state = new_state
+
+        # Auto-save scar to LattiMemoryStore on contract violations:
+        # - blocking validations (Operator returned wrong shape)
+        # - constitutional wall blocks (force-push, secrets, rm -rf, etc.)
+        # Each event becomes a typed MemoryRecord persisted under ~/.latti/memory/.
+        self._maybe_save_scar(action, observation)
+
+        # Run evaluators against the post-step state and stash any verdicts.
+        # The LLM-call hook drains this queue so multi-tool turns don't
+        # clobber a 'replan' verdict (state.last_observation gets overwritten
+        # by each subsequent tool's observation).
+        eval_events = self._evaluate_state_after_step()
+        if eval_events:
+            self._pending_eval_events.extend(eval_events)
+
+        # Convert Observation → ToolExecutionResult
+        if observation.kind == 'success':
+            return ToolExecutionResult(
+                name=observation.payload.get('tool_name', tool_call.name),
+                ok=True,
+                content=observation.payload.get('content', ''),
+                metadata=observation.payload.get('metadata', {}) or {},
+            )
+        return ToolExecutionResult(
+            name=observation.payload.get('tool_name', tool_call.name),
+            ok=False,
+            content=observation.payload.get('content') or observation.payload.get('error', 'state-machine dispatch failed'),
+            metadata=observation.payload.get('metadata', {}) or {},
+        )
+
+    def _register_goal_from_prompt(self, prompt: str, session_id: str):
+        """Register a typed Goal in GoalRegistry whenever a real user prompt
+        starts a session. The Goal's title is the first 80 chars of the prompt;
+        full prompt persists as a success criterion. Failures are silent.
+
+        Returns the registered Goal (or None if registration was skipped).
+        """
+        if not isinstance(prompt, str) or not prompt.strip():
+            return None
+        if os.environ.get('LATTI_USE_STATE_MACHINE') == '0':
+            return None
+        try:
+            from .agent_state_machine import Goal
+            registry = self.state_machine_goals()
+            if registry is None:
+                return None
+            title = prompt.strip().splitlines()[0][:80]
+            goal = Goal.new(
+                title=title,
+                success_criteria=(prompt.strip()[:500],),
+                owner='user',
+            )
+            registry.register(goal)
+            return goal
+        except Exception:
+            return None
+
+    def _mark_goal_done(self, goal) -> None:
+        """Append a 'done' line to GoalRegistry for this goal. Best-effort —
+        any failure (registry missing, FS error) is silent so completion-
+        marking can never break a successful run."""
+        if goal is None:
+            return
+        try:
+            registry = self.state_machine_goals()
+            if registry is None:
+                return
+            registry.mark_done(goal.id)
+        except Exception:
+            pass
+
+    def _maybe_save_scar(self, action, observation) -> None:
+        """If the observation indicates a contract violation, persist a scar.
+
+        Triggers:
+          - observation.payload['blocking_validations'] present (Validator blocked)
+          - observation.payload['wall'] present (constitutional wall blocked)
+
+        The scar goes to ~/.latti/memory/ via LattiMemoryStore as a typed
+        MemoryRecord(kind='scar'). Failures are silent — scar persistence
+        must never break the dispatch path.
+        """
+        # Only error observations can be scar-worthy
+        if observation.kind != 'error':
+            return
+        payload = observation.payload or {}
+        is_wall_block = bool(payload.get('wall'))
+        is_validator_block = 'blocking_validations' in payload
+        if not (is_wall_block or is_validator_block):
+            return
+
+        try:
+            from .agent_state_machine import MemoryRecord
+            store = self.state_machine_memory()
+            if store is None:
+                return
+
+            session_id = getattr(self._sm_state, 'session_id', None) if self._sm_state else None
+            tool_name = payload.get('tool_name') or action.payload.get('tool_name', 'unknown')
+
+            if is_wall_block:
+                wall = payload.get('wall', 'unknown_wall')
+                kind_label = f'wall_{wall}'
+                body = (
+                    f'**TRIGGER:** action.kind={action.kind} tool={tool_name!r}\n\n'
+                    f'**WALL:** {wall}\n\n'
+                    f'**ACTION PAYLOAD:** {dict(action.payload)}\n\n'
+                    f'**WHY THIS IS A SCAR:** A constitutional wall blocked this action '
+                    f'before operator dispatch. The next instance must recognize this '
+                    f'pattern and avoid the same shape.'
+                )
+                description = f'wall {wall} blocked {tool_name!r}'
+            else:
+                blocking = payload.get('blocking_validations') or []
+                check_names = [
+                    c.get('name', '?')
+                    for v in blocking
+                    for c in v.get('checks', [])
+                    if not c.get('passed', True)
+                ]
+                # Distinct check-name signatures → distinct scar files.
+                # Identical signatures → same filename → overwrite (dedup).
+                # Sort + cap to keep filename bounded and order-stable.
+                _signature = '_'.join(sorted(set(check_names))[:3]) or 'unnamed'
+                kind_label = f'validator_block_{_signature}'
+                body = (
+                    f'**TRIGGER:** action.kind={action.kind} tool={tool_name!r}\n\n'
+                    f'**FAILED CHECKS:** {", ".join(check_names) or "(unnamed)"}\n\n'
+                    f'**WHY THIS IS A SCAR:** A post-execution Validator blocked the '
+                    f'observation. Either the Operator returned a misshapen result or '
+                    f'the contract changed. Investigate before assuming legitimate use.'
+                )
+                description = f'validator blocked {tool_name!r} on {check_names[:2]}'
+
+            record = MemoryRecord.new(
+                kind='scar',
+                body=body,
+                source_session_id=session_id,
+                source_turn_id=getattr(self._sm_state, 'turn_id', None) if self._sm_state else None,
+            )
+            store.save(record, name=kind_label, description=description)
+        except Exception:
+            # Scar persistence is best-effort. Never break the dispatch path.
+            pass
+
+    @staticmethod
+    def _tool_call_detail(tool_call) -> str:
+        """Extract a human-readable detail string for TUI display."""
+        args = tool_call.arguments or {}
+        name = tool_call.name
+        if name in ('read_file', 'write_file', 'edit_file'):
+            return str(args.get('path', ''))
+        if name == 'bash':
+            cmd = str(args.get('command', ''))
+            # Strip leading `cd /path && ` or `cd /path;` preamble — it's
+            # boilerplate working-dir noise, not the meaningful command.
+            import re as _re
+            cmd = _re.sub(r'^(cd\s+\S+\s*(?:&&|;)\s*)+', '', cmd).strip()
+            return cmd[:80] + '...' if len(cmd) > 80 else cmd
+        if name in ('glob_search', 'grep_search'):
+            return str(args.get('pattern', ''))
+        if name == 'lattice_solve':
+            p = str(args.get('problem', ''))
+            return p[:80] + '...' if len(p) > 80 else p
+        if name == 'list_dir':
+            return str(args.get('path', '.'))
+        if name == 'web_fetch':
+            return str(args.get('url', ''))
+        if name == 'web_search':
+            return str(args.get('query', ''))
+        return ''
 
     def _tool_calls_from_message(
         self,
@@ -1333,6 +3171,51 @@ class LocalCodingAgent:
                 reason=(
                     'Stopped because the session-turn budget was exceeded '
                     f'({session_turns} > {budget.max_session_turns}).'
+                ),
+            )
+        # 2026-04-27: third recurrence of this regression. The hardcoded
+        # _SAFETY_MAX_COST_USD = 10.0 ceiling keeps getting re-added by
+        # code refactors and silently killing long latti sessions at $10.14.
+        # User reported it twice today. This time: remove the ceiling
+        # entirely. The BudgetConfig defaults already provide explicit opt-in
+        # caps via --max-budget-usd / --max-model-calls; an implicit hidden
+        # wall on top of those is redundant and surprising.
+        #
+        # Env-var opt-in preserved for callers that want the safety net:
+        #   LATTI_SAFETY_MAX_COST_USD=10     # cost cap in USD, 0/unset = no wall
+        #   LATTI_SAFETY_MAX_MODEL_CALLS=200 # call cap, 0/unset = no wall
+        import os as _os
+        try:
+            _c_raw = _os.environ.get('LATTI_SAFETY_MAX_COST_USD', '').strip()
+            _SAFETY_MAX_COST_USD = float(_c_raw) if _c_raw else 0.0
+        except ValueError:
+            _SAFETY_MAX_COST_USD = 0.0
+        try:
+            _m_raw = _os.environ.get('LATTI_SAFETY_MAX_MODEL_CALLS', '').strip()
+            _SAFETY_MAX_MODEL_CALLS = int(_m_raw) if _m_raw else 0
+        except ValueError:
+            _SAFETY_MAX_MODEL_CALLS = 0
+
+        if (budget.max_total_cost_usd is None
+                and _SAFETY_MAX_COST_USD > 0
+                and total_cost_usd > _SAFETY_MAX_COST_USD):
+            return BudgetDecision(
+                exceeded=True,
+                reason=(
+                    f'Stopped: estimated cost (${total_cost_usd:.2f}) hit the '
+                    f'safety ceiling (${_SAFETY_MAX_COST_USD:.2f}). '
+                    f'Set --max-budget-usd to raise or unset LATTI_SAFETY_MAX_COST_USD.'
+                ),
+            )
+        if (budget.max_model_calls is None
+                and _SAFETY_MAX_MODEL_CALLS > 0
+                and model_calls > _SAFETY_MAX_MODEL_CALLS):
+            return BudgetDecision(
+                exceeded=True,
+                reason=(
+                    f'Stopped: {model_calls} model calls hit the safety ceiling '
+                    f'({_SAFETY_MAX_MODEL_CALLS}). '
+                    f'Set --max-model-calls or unset LATTI_SAFETY_MAX_MODEL_CALLS.'
                 ),
             )
         return BudgetDecision(exceeded=False)
@@ -2231,37 +4114,44 @@ class LocalCodingAgent:
                 ok=False,
                 content='prompt must be a non-empty string or subtasks must contain at least one prompt',
             )
-
-        # Resolve child permissions — read-only agents get no write/shell
+        # Resolve child permissions — read-only agents (whose definition
+        # disallows write tools) get no write/shell. Otherwise inherit from
+        # parent unless caller explicitly restricts. allow_write / allow_shell
+        # default to inherit — caller can pass False to restrict, but we don't
+        # silently cripple children. allow_destructive inherits from parent.
         if agent_def.disallowed_tools and (
             'edit_file' in agent_def.disallowed_tools
             or 'write_file' in agent_def.disallowed_tools
         ):
-            # Read-only agent (Explore, Plan, verification)
             child_permissions = AgentPermissions(
                 allow_file_write=False,
                 allow_shell_commands=self.runtime_config.permissions.allow_shell_commands,
                 allow_destructive_shell_commands=False,
             )
         else:
+            _allow_write = arguments.get('allow_write')
+            _allow_shell = arguments.get('allow_shell')
             child_permissions = AgentPermissions(
                 allow_file_write=(
                     self.runtime_config.permissions.allow_file_write
-                    and bool(arguments.get('allow_write', False))
+                    if _allow_write is None
+                    else (self.runtime_config.permissions.allow_file_write and bool(_allow_write))
                 ),
                 allow_shell_commands=(
                     self.runtime_config.permissions.allow_shell_commands
-                    and bool(arguments.get('allow_shell', False))
+                    if _allow_shell is None
+                    else (self.runtime_config.permissions.allow_shell_commands and bool(_allow_shell))
                 ),
-                allow_destructive_shell_commands=False,
+                allow_destructive_shell_commands=(
+                    self.runtime_config.permissions.allow_destructive_shell_commands
+                ),
             )
-
-        # Resolve max_turns — agent definition or explicit param
-        effective_max_turns = max_turns or agent_def.max_turns or min(self.runtime_config.max_turns, 6)
-
+        # max_turns: use caller-supplied value if given, otherwise inherit
+        # from parent without any hardcoded cap. A cap of 6 was silently
+        # killing long autonomous subtasks.
         child_runtime_config = replace(
             self.runtime_config,
-            max_turns=effective_max_turns,
+            max_turns=max_turns if max_turns is not None else self.runtime_config.max_turns,
             permissions=child_permissions,
             auto_compact_threshold_tokens=self.runtime_config.auto_compact_threshold_tokens,
         )
@@ -3276,8 +5166,18 @@ class LocalCodingAgent:
         result: AgentRunResult,
     ) -> AgentRunResult:
         if result.session_id is None:
+            # Even on no-session-id paths, clear pending eval stash so it
+            # doesn't leak into the next session.
+            if self._pending_eval_events:
+                self._pending_eval_events.clear()
             return result
         persist_events = list(result.events)
+        # Backstop named in 9218119 NOT-COVERED: drain any per-tool eval
+        # events that didn't make it through the LLM-call hook (e.g. terminal
+        # tool ended the turn directly). Without this they leak across runs.
+        if self._pending_eval_events:
+            persist_events.extend(self._pending_eval_events)
+            self._pending_eval_events.clear()
         if self.plugin_runtime is not None:
             persist_messages = self.plugin_runtime.before_persist_injections()
             if persist_messages:
@@ -3341,6 +5241,11 @@ class LocalCodingAgent:
                 if self.plugin_runtime is not None
                 else {}
             ),
+            typed_state=(
+                self._sm_state.to_dict()
+                if self._sm_state is not None and hasattr(self._sm_state, 'to_dict')
+                else {}
+            ),
             scratchpad_directory=result.scratchpad_directory,
         )
         path = save_agent_session(
@@ -3348,6 +5253,17 @@ class LocalCodingAgent:
             directory=self.runtime_config.session_directory,
         )
         self.last_session_path = str(path)
+        checkpoint_event = {
+            'type': 'session_checkpoint',
+            'session_id': result.session_id,
+            'session_path': self.last_session_path,
+            'typed_state_checkpointed': bool(stored.typed_state),
+            'typed_state_turn_id': stored.typed_state.get('turn_id'),
+            'turns': stored.turns,
+            'tool_calls': stored.tool_calls,
+        }
+        persist_events.append(checkpoint_event)
+        self._emit_runtime_event(checkpoint_event)
         return replace(
             result,
             session_path=self.last_session_path,
@@ -4110,10 +6026,398 @@ class LocalCodingAgent:
         )
         self.resume_source_session_id = None
 
+    def _check_rotation_activation(self, prompt: str) -> str:
+        """Check if rotation signal exists and activate if needed.
+        
+        If the rotation gate fired in a prior turn, a signal file will exist.
+        This method detects it, activates self-axis mode, and returns a modified
+        prompt that includes the self-directed task.
+        
+        Returns the original prompt if no rotation signal, or a self-axis prompt
+        if rotation is activated.
+        """
+        import sys
+        from pathlib import Path
+        try:
+            latti_home = Path.home() / '.latti'
+            if not (latti_home / 'last_session').is_file():
+                return prompt
+            
+            sys.path.insert(0, str(latti_home / 'lib'))
+            from rotation_activator import activate_rotation  # type: ignore[import-not-found]
+            
+            activation = activate_rotation()
+            if activation.activated and activation.prompt:
+                # Log activation
+                import json
+                import time
+                journal_path = latti_home / 'memory' / 'rotation_journal.jsonl'
+                journal_path.parent.mkdir(parents=True, exist_ok=True)
+                
+                entry = {
+                    'timestamp': time.time(),
+                    'event': 'rotation_activated',
+                    'task_id': activation.task_id,
+                    'task_title': activation.task_title,
+                }
+                with open(journal_path, 'a') as f:
+                    f.write(json.dumps(entry) + '\n')
+                
+                # Return the self-axis prompt
+                return activation.prompt
+        except Exception:
+            # Fail silent — must never break the model loop
+            pass
+        
+        return prompt
+    
+    def _check_rotation_gate(self, result: AgentRunResult) -> None:
+        """Check if we should rotate to self-directed work.
+        
+        This is the decision gate that prevents orbit. It evaluates three layers
+        of cost (audit, orbit, debt) and forces rotation if total cost exceeds
+        threshold. Best-effort; failures are swallowed.
+        """
+        import sys
+        from pathlib import Path
+        try:
+            latti_home = Path.home() / '.latti'
+            if not (latti_home / 'last_session').is_file():
+                return
+            
+            sys.path.insert(0, str(latti_home / 'lib'))
+            from rotation_gate import should_rotate  # type: ignore[import-not-found]
+            
+            if should_rotate():
+                # Log rotation decision
+                import json
+                import time
+                journal_path = latti_home / 'memory' / 'rotation_journal.jsonl'
+                journal_path.parent.mkdir(parents=True, exist_ok=True)
+                
+                entry = {
+                    'timestamp': time.time(),
+                    'session_id': os.environ.get('LATTI_SESSION_ID', result.session_id),
+                    'reason': 'rotation_gate_fired',
+                    'turns': result.turns,
+                    'stop_reason': result.stop_reason,
+                }
+                with open(journal_path, 'a') as f:
+                    f.write(json.dumps(entry) + '\n')
+                
+                # Trigger rotation: pick a pending self-axis task and write signal
+                try:
+                    from rotation_trigger import trigger_rotation  # type: ignore[import-not-found]
+                    session_id = os.environ.get('LATTI_SESSION_ID', result.session_id)
+                    if trigger_rotation(session_id):
+                        # Rotation signal written; caller can detect and act on it
+                        pass
+                except Exception:
+                    pass  # Rotation trigger is best-effort
+        except Exception:
+            # Fail silent — must never break the model loop
+            pass
+
+    def _compute_response_quality(self, result: AgentRunResult) -> int:
+        """Compute response quality score (0-100) based on response characteristics.
+        
+        Evaluates:
+        - Tool usage (20 points): Did the agent use tools?
+        - Conciseness (10 points): Is the response reasonably sized?
+        - No anti-patterns (10 points): Avoids common failure modes
+        - No trailing questions (10 points): Doesn't end with permission-seeking
+        - No permission asking (10 points): Doesn't ask for permission
+        - Substantive output (40 points): Has meaningful final output
+        
+        Returns: 0-100 score
+        """
+        try:
+            score = 0
+            final_output = getattr(result, 'final_output', '') or ''
+            
+            # Tool usage (20 points)
+            if len(result.tool_calls) > 0:
+                score += 20
+            
+            # Conciseness (10 points) - reasonable length
+            output_len = len(final_output.strip())
+            if 50 < output_len < 5000:
+                score += 10
+            elif output_len > 0:
+                score += 5  # Partial credit for any output
+            
+            # No anti-patterns (10 points)
+            anti_patterns = [
+                'i cannot', 'i am unable', 'i do not have access',
+                'i cannot help', 'i cannot provide', 'i cannot create',
+                'i cannot write', 'i cannot generate', 'i cannot execute',
+            ]
+            has_anti_pattern = any(
+                pattern in final_output.lower() 
+                for pattern in anti_patterns
+            )
+            if not has_anti_pattern:
+                score += 10
+            
+            # No trailing questions (10 points)
+            if final_output.strip() and not final_output.strip().endswith('?'):
+                score += 10
+            
+            # No permission asking (10 points)
+            permission_phrases = [
+                'would you like', 'do you want', 'should i',
+                'may i', 'can i', 'shall i', 'would you prefer',
+            ]
+            asks_permission = any(
+                phrase in final_output.lower()
+                for phrase in permission_phrases
+            )
+            if not asks_permission:
+                score += 10
+            
+            # Substantive output (40 points)
+            if output_len > 100:
+                score += 40
+            elif output_len > 50:
+                score += 20
+            elif output_len > 0:
+                score += 10
+            
+            return min(100, score)
+        except Exception:
+            # Default to neutral score on error
+            return 50
+
+    def _record_self_axis_outcome(self, result: AgentRunResult) -> None:
+        """Record outcome of a self-axis task for feedback loop analysis.
+        
+        This captures metrics before/after a self-directed work session so the
+        pattern learner can identify which task types lead to system improvements.
+        Best-effort; failures are swallowed.
+        """
+        import sys
+        from pathlib import Path
+        try:
+            latti_home = Path.home() / '.latti'
+            if not (latti_home / 'last_session').is_file():
+                return
+            
+            sys.path.insert(0, str(latti_home / 'lib'))
+            from outcome_recorder import record_task_outcome  # type: ignore[import-not-found]
+            
+            # Compute response quality score
+            quality_score = self._compute_response_quality(result)
+            
+            # Check if this was a self-axis task (indicated by rotation activation)
+            # We detect this by checking if the prompt contained self-axis markers
+            # For now, we record all outcomes and let the recorder filter
+            record_task_outcome(
+                task_id=os.environ.get('LATTI_TASK_ID', 'unknown'),
+                title=os.environ.get('LATTI_TASK_TITLE', 'self-axis-work'),
+                success=result.stop_reason == 'end_turn',
+                changes_made=len(result.tool_calls) > 0,
+                metrics={
+                    'turns': result.turns,
+                    'tool_calls': len(result.tool_calls),
+                    'stop_reason': result.stop_reason,
+                    'quality_score': quality_score,
+                }
+            )
+        except Exception:
+            # Fail silent — must never break the model loop
+            pass
+
     def _accumulate_usage(self, result: AgentRunResult) -> None:
         """Add a run's usage to the cumulative session totals."""
         self.cumulative_usage = self.cumulative_usage + result.usage
         self.cumulative_cost_usd += result.total_cost_usd
+        self._emit_cost_ledger(result)
+        self._emit_session_turn(result)
+        self._emit_claims(result)
+        self._record_scar(result)
+
+    def _emit_claims(self, result: AgentRunResult) -> None:
+        """Extract substantive claims from final_output and register them so
+        future sessions can recognize echoes of the AI's own positions
+        without re-deriving from scratch. Best-effort; no-op without Latti."""
+        import sys
+        from pathlib import Path
+        try:
+            latti_home = Path.home() / '.latti'
+            if not (latti_home / 'last_session').is_file():
+                return
+            scripts = latti_home / 'scripts'
+            if str(scripts) not in sys.path:
+                sys.path.insert(0, str(scripts))
+            from claims import register_from_response  # type: ignore[import-not-found]
+            final_output = getattr(result, 'final_output', '') or ''
+            if not final_output or len(final_output) < 80:
+                return
+            
+            # ENFORCE CITATIONS: rewrite uncited claims before registering
+            # This is the independent axis work that breaks orbit
+            try:
+                sys.path.insert(0, str(Path(__file__).parent))
+                from citation_enforcer_v2 import enforce_citations
+                final_output, is_clean = enforce_citations(final_output, strict=False)
+                # Update result with rewritten output
+                if hasattr(result, 'final_output'):
+                    result.final_output = final_output
+            except Exception:
+                pass  # Citation enforcement is best-effort
+            
+            register_from_response(
+                final_output,
+                session_id=os.environ.get('LATTI_SESSION_ID'),
+            )
+            # Audit the response for uncited claims (Phase 2 integration)
+            self._audit_response_claims(result, final_output)
+        except Exception:
+            pass
+
+    def _audit_response_claims(self, result: AgentRunResult, final_output: str) -> None:
+        """Audit the response for uncited claims and log to audit journal.
+        
+        Gated by LATTI_AUDIT env var (default 1 when invoked via shim).
+        Best-effort; failures are swallowed to avoid disrupting the model loop.
+        """
+        import sys
+        from pathlib import Path
+        
+        # Check if audit is enabled
+        if os.environ.get('LATTI_AUDIT', '0') != '1':
+            return
+        
+        try:
+            latti_home = Path.home() / '.latti'
+            if not (latti_home / 'last_session').is_file():
+                return
+            
+            # Import the audit integration
+            sys.path.insert(0, str(latti_home))
+            sys.path.insert(0, str(latti_home / 'lib'))
+            from agent_audit_integration import audit_agent_response  # type: ignore[import-not-found]
+            
+            # Run the audit
+            check_hard_fail = os.environ.get('LATTI_AUDIT_HARD_FAIL', '0') == '1'
+            audit_result = audit_agent_response(
+                final_output,
+                fail_mode='warn',
+                check_hard_fail=check_hard_fail,
+            )
+            
+            # Log to audit journal
+            if audit_result:
+                import json
+                import time
+                journal_path = latti_home / 'memory' / 'audit_journal.jsonl'
+                journal_path.parent.mkdir(parents=True, exist_ok=True)
+                
+                entry = {
+                    'timestamp': time.time(),
+                    'session_id': os.environ.get('LATTI_SESSION_ID', 'unknown'),
+                    'passed': audit_result.get('passed', False),
+                    'uncited_count': audit_result.get('uncited_count', 0),
+                    'severity_max': audit_result.get('severity_max', 0.0),
+                    'corrections': audit_result.get('corrections', []),
+                }
+                with open(journal_path, 'a') as f:
+                    f.write(json.dumps(entry) + '\n')
+                
+                # Generate auto-correction tasks (independent axis work)
+                # This breaks orbit: audit failures → auto-generated work
+                if not audit_result.get('passed', True):
+                    try:
+                        from audit_auto_correction import generate_correction_task, record_correction_task
+                        task = generate_correction_task(
+                            audit_result,
+                            session_id=os.environ.get('LATTI_SESSION_ID'),
+                        )
+                        if task:
+                            record_correction_task(task)
+                    except Exception:
+                        pass  # Fail silent on auto-correction generation
+        except Exception:
+            # Fail silent — must never break the model loop
+            pass
+
+    def _emit_cost_ledger(self, result: AgentRunResult) -> None:
+        """Append a cost-ledger entry to Latti's cost-ledger.jsonl.
+
+        Opt-in via LATTI_COST_LEDGER env var pointing to the ledger file,
+        or default location ~/.latti/memory/cost-ledger.jsonl.
+        Emission is best-effort; failures are swallowed to avoid disrupting runs.
+        """
+        import os
+        import json
+        import time
+        from pathlib import Path
+
+        try:
+            # Opt-in: default to ~/.latti/memory/cost-ledger.jsonl if dir exists
+            default_ledger = Path.home() / '.latti' / 'memory' / 'cost-ledger.jsonl'
+            ledger_path = os.environ.get('LATTI_COST_LEDGER')
+            if ledger_path:
+                ledger = Path(ledger_path)
+            elif default_ledger.parent.is_dir():
+                ledger = default_ledger
+            else:
+                return  # No latti install → no-op
+
+            usage = result.usage
+            entry = {
+                'ts': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+                'model': getattr(self.model_config, 'model', 'unknown'),
+                'tokens_in': int(getattr(usage, 'input_tokens', 0) or 0),
+                'tokens_out': int(getattr(usage, 'output_tokens', 0) or 0),
+                'cache_creation': int(getattr(usage, 'cache_creation_input_tokens', 0) or 0),
+                'cache_read': int(getattr(usage, 'cache_read_input_tokens', 0) or 0),
+                'cost_usd': float(getattr(result, 'total_cost_usd', 0.0) or 0.0),
+                'session_id': os.environ.get('LATTI_SESSION_ID', 'unknown'),
+            }
+            ledger.parent.mkdir(parents=True, exist_ok=True)
+            with ledger.open('a', encoding='utf-8') as fh:
+                fh.write(json.dumps(entry, separators=(',', ':')) + '\n')
+        except Exception:
+            # Best-effort logging: never crash the run on ledger failure
+            pass
+
+    def _emit_session_turn(self, result: AgentRunResult) -> None:
+        """Append a turn record to Latti's session_work.md via session_context.py.
+
+        Runs only when a Latti install is detected (~/.latti/last_session exists).
+        Best-effort: failures are swallowed to avoid disrupting runs.
+        """
+        import sys
+        from pathlib import Path
+
+        try:
+            latti_home = Path.home() / '.latti'
+            if not (latti_home / 'last_session').is_file():
+                return  # Not running under Latti → no-op
+
+            if str(latti_home) not in sys.path:
+                sys.path.insert(0, str(latti_home))
+            from session_context import append_turn  # type: ignore[import-not-found]
+
+            # Summarize this turn concisely
+            turn_num = int(getattr(result, 'turns', 0) or 0)
+            tool_calls = int(getattr(result, 'tool_calls', 0) or 0)
+            stop_reason = getattr(result, 'stop_reason', None) or 'ok'
+            final_output = getattr(result, 'final_output', '') or ''
+            # Action: full output (no truncation) with newlines collapsed
+            summary = final_output.strip().replace('\n', ' ')
+            if not summary:
+                summary = f'({tool_calls} tool calls)'
+            note = f'turns={turn_num} tools={tool_calls}'
+            # Use cumulative turn counter as the visible turn number so each run
+            # is its own entry even if internal turns==0 on fast paths
+            if not hasattr(self, '_latti_turn_counter'):
+                self._latti_turn_counter = 0
+            self._latti_turn_counter += 1
+            append_turn(self._latti_turn_counter, summary, stop_reason, note)
+        except Exception:
+            pass
 
     def _refresh_runtime_views_for_tool_result(
         self,
@@ -4215,6 +6519,7 @@ class LocalCodingAgent:
             workflow_runtime=self.workflow_runtime,
             worktree_runtime=self.worktree_runtime,
         )
+        self._sm_runner = None
 
     def _apply_runtime_cwd_update(self, new_cwd: Path) -> None:
         resolved_cwd = new_cwd.resolve()
@@ -4305,6 +6610,7 @@ class LocalCodingAgent:
             workflow_runtime=self.workflow_runtime,
             worktree_runtime=self.worktree_runtime,
         )
+        self._sm_runner = None
 
     def _apply_plugin_before_prompt_hooks(self, prompt: str) -> str:
         if self.plugin_runtime is None:
@@ -4406,6 +6712,69 @@ class LocalCodingAgent:
                 }
             )
         return replace(updated, events=tuple(appended))
+    
+    def _record_scar(self, result: AgentRunResult) -> None:
+        """Record the outcome of this session as a scar for future learning.
+        
+        A scar captures: what problem was solved, which model was used,
+        what the outcome was, and what lesson to apply next time.
+        """
+        if self.scar_router is None or not self.last_session:
+            return
+        
+        try:
+            # Extract the problem description from the first user message
+            problem_description = ''
+            for msg in self.last_session.messages:
+                if getattr(msg, 'role', None) == 'user':
+                    problem_description = getattr(msg, 'content', '') or ''
+                    break
+            
+            if not problem_description:
+                return
+            
+            # Determine outcome using a richer eval signal.
+            # "end_turn" alone is too naive — the model could end_turn after
+            # producing garbage. We score on multiple signals:
+            #   - Hard failures: budget_exceeded, backend_error, max_turns,
+            #     prompt_too_long, empty_responses → failure
+            #   - Produced output + used tools → success
+            #   - Produced output, no tools → partial (may have just chatted)
+            #   - No output → failure
+            stop = result.stop_reason or ''
+            final_output = getattr(result, 'final_output', '') or ''
+            tool_calls = int(getattr(result, 'tool_calls', 0) or 0)
+
+            hard_failures = {
+                'budget_exceeded', 'backend_error', 'max_turns',
+                'prompt_too_long', 'empty_responses', 'resume_load_error',
+            }
+            if stop in hard_failures:
+                outcome = 'failure'
+            elif not final_output.strip():
+                outcome = 'failure'
+            elif stop == 'end_turn' and tool_calls > 0:
+                outcome = 'success'
+            elif stop == 'end_turn' and len(final_output.strip()) > 100:
+                # Produced a substantive response even without tool calls
+                outcome = 'success'
+            elif stop == 'end_turn':
+                outcome = 'partial'
+            else:
+                outcome = 'partial'
+            
+            # Record the scar
+            self.scar_router.record_outcome(
+                problem_description=problem_description[:200],  # Truncate for storage
+                model_used=self.model_config.model,
+                cost=result.total_cost_usd,
+                outcome=outcome,
+                session_id=self.active_session_id or 'unknown',
+                reasoning_tokens=result.usage.reasoning_tokens or 0,
+            )
+        except Exception:
+            # Best-effort; don't disrupt the session if scar recording fails
+            pass
 
 
 def _optional_policy_int(value: object) -> int | None:

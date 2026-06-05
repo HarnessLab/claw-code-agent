@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from typing import Any, Iterator
+import os
 from urllib import error, request
 
 from .agent_types import (
@@ -12,6 +13,8 @@ from .agent_types import (
     ToolCall,
     UsageStats,
 )
+from .cost_ledger import log_api_call
+from .prompt_cache import extract_cache_stats
 
 
 class OpenAICompatError(RuntimeError):
@@ -116,6 +119,27 @@ def _parse_usage(payload: Any) -> UsageStats:
     )
 
 
+def _inject_system_cache_control(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return a shallow-copied message list with cache_control on the system message.
+
+    The system message is always the first message with role='system'.
+    We add ``cache_control: {type: ephemeral}`` so that Claude API (or a
+    LiteLLM proxy that forwards it) can cache the static system prompt across
+    turns, saving ~90% of system-prompt token costs.
+
+    If no system message is found, the list is returned unchanged.
+    """
+    result = list(messages)  # shallow copy — don't mutate caller's list
+    for i, msg in enumerate(result):
+        if isinstance(msg, dict) and msg.get('role') == 'system':
+            if 'cache_control' not in msg:
+                result[i] = {**msg, 'cache_control': {'type': 'ephemeral'}}
+            break  # Only the first system message needs caching
+    return result
+
+
 def _build_response_format(
     schema: OutputSchemaConfig | None,
 ) -> dict[str, Any] | None:
@@ -131,11 +155,59 @@ def _build_response_format(
     }
 
 
+# DNS-retry policy. Live failure on 2026-05-04 07:32: a transient
+# socket.gaierror (errno 8 / EAI_NONAME) wrapped in URLError killed
+# the turn at SAVE prompt, despite `nslookup openrouter.ai` succeeding
+# moments later. Connection-refused / timeout / HTTPError are NOT
+# retried here — masking those is worse than failing fast. Only the
+# specific transient-DNS shape is absorbed.
+_DNS_RETRY_DELAYS_SECONDS = (0.1, 0.3)
+"""Sleep before retry N. Total worst-case added latency on persistent
+DNS failure: 0.4s before raising; transient blips clear on the first
+retry. Tuple length = max retry count."""
+
+
+def _is_transient_dns_failure(exc: BaseException) -> bool:
+    """True iff the exception is a URLError caused by a socket.gaierror
+    (DNS resolution failure). All other URLError reasons (connection
+    refused, timeout, etc.) return False — those signal real problems
+    and must surface immediately, not be masked by retry.
+    """
+    import socket as _socket
+    from urllib.error import URLError as _URLError
+    if not isinstance(exc, _URLError):
+        return False
+    return isinstance(exc.reason, _socket.gaierror)
+
+
 class OpenAICompatClient:
     """Minimal OpenAI-compatible chat client for local model servers."""
 
     def __init__(self, config: ModelConfig) -> None:
         self.config = config
+
+    def _urlopen_with_dns_retry(self, req, timeout):
+        """Open the request, transparently retrying transient DNS failures.
+
+        Sleeps from _DNS_RETRY_DELAYS_SECONDS between attempts.
+        Surfaces the original URLError on persistent failure, so the
+        caller's existing exception handling (which wraps URLError into
+        OpenAICompatError) keeps working unchanged.
+        """
+        import time as _time
+        last_exc = None
+        for delay in (0.0,) + _DNS_RETRY_DELAYS_SECONDS:
+            if delay > 0:
+                _time.sleep(delay)
+            try:
+                return request.urlopen(req, timeout=timeout)
+            except error.URLError as exc:
+                if not _is_transient_dns_failure(exc):
+                    raise
+                last_exc = exc
+        # Exhausted retries on persistent DNS failure — re-raise the last.
+        assert last_exc is not None
+        raise last_exc
 
     def complete(
         self,
@@ -143,6 +215,7 @@ class OpenAICompatClient:
         tools: list[dict[str, Any]],
         *,
         output_schema: OutputSchemaConfig | None = None,
+        model_override: str | None = None,
     ) -> AssistantTurn:
         payload = self._request_json(
             self._build_payload(
@@ -150,6 +223,7 @@ class OpenAICompatClient:
                 tools=tools,
                 stream=False,
                 output_schema=output_schema,
+                model_override=model_override,
             )
         )
         choices = payload.get('choices')
@@ -170,12 +244,39 @@ class OpenAICompatClient:
         if finish_reason is not None and not isinstance(finish_reason, str):
             finish_reason = str(finish_reason)
 
+        usage = _parse_usage(payload.get('usage'))
+
+        # Extract thinking from o1/o3 models
+        thinking = ''
+        content_blocks = message.get('content')
+        if isinstance(content_blocks, list):
+            for block in content_blocks:
+                if isinstance(block, dict) and block.get('type') == 'thinking':
+                    thinking = block.get('thinking', '')
+                    break
+
+        # Log API call cost (includes cache creation/read tokens)
+        model = model_override or self.config.model
+        log_api_call(model, usage)
+
+        # Log cache performance when cache tokens are present
+        if usage.cache_creation_input_tokens or usage.cache_read_input_tokens:
+            cache_stats = extract_cache_stats(usage)
+            import logging as _logging
+            _logging.getLogger(__name__).debug(
+                'prompt cache: creation=%d read=%d hit_rate=%.1f%%',
+                cache_stats.cache_creation_tokens,
+                cache_stats.cache_read_tokens,
+                cache_stats.cache_hit_rate * 100,
+            )
+
         return AssistantTurn(
             content=content,
             tool_calls=tuple(tool_calls),
             finish_reason=finish_reason,
             raw_message=message,
-            usage=_parse_usage(payload.get('usage')),
+            usage=usage,
+            thinking=thinking,
         )
 
     def stream(
@@ -184,24 +285,37 @@ class OpenAICompatClient:
         tools: list[dict[str, Any]],
         *,
         output_schema: OutputSchemaConfig | None = None,
+        model_override: str | None = None,
     ) -> Iterator[StreamEvent]:
         payload = self._build_payload(
             messages=messages,
             tools=tools,
             stream=True,
             output_schema=output_schema,
+            model_override=model_override,
         )
+        headers = {
+            'Authorization': f'Bearer {self.config.api_key}',
+            'Content-Type': 'application/json',
+        }
+        # GitHub Copilot requires extra headers when base_url is githubcopilot.com
+        if 'githubcopilot.com' in self.config.base_url or os.environ.get('LATTI_COPILOT_HEADERS'):
+            headers.update({
+                'User-Agent':            'GitHubCopilotChat/0.35.0',
+                'Editor-Version':        'vscode/1.107.0',
+                'Editor-Plugin-Version': 'copilot-chat/0.35.0',
+                'Copilot-Integration-Id':'vscode-chat',
+                'X-Initiator':           'user',
+                'Openai-Intent':         'conversation-edits',
+            })
         req = request.Request(
             _join_url(self.config.base_url, '/chat/completions'),
             data=json.dumps(payload).encode('utf-8'),
-            headers={
-                'Authorization': f'Bearer {self.config.api_key}',
-                'Content-Type': 'application/json',
-            },
+            headers=headers,
             method='POST',
         )
         try:
-            with request.urlopen(req, timeout=self.config.timeout_seconds) as response:
+            with self._urlopen_with_dns_retry(req, timeout=self.config.timeout_seconds) as response:
                 yield StreamEvent(type='message_start')
                 for event_payload in self._iter_sse_payloads(response):
                     yield from self._parse_stream_payload(event_payload)
@@ -217,17 +331,27 @@ class OpenAICompatClient:
 
     def _request_json(self, payload: dict[str, Any]) -> dict[str, Any]:
         body = json.dumps(payload).encode('utf-8')
+        headers = {
+            'Authorization': f'Bearer {self.config.api_key}',
+            'Content-Type': 'application/json',
+        }
+        if 'githubcopilot.com' in self.config.base_url or os.environ.get('LATTI_COPILOT_HEADERS'):
+            headers.update({
+                'User-Agent':            'GitHubCopilotChat/0.35.0',
+                'Editor-Version':        'vscode/1.107.0',
+                'Editor-Plugin-Version': 'copilot-chat/0.35.0',
+                'Copilot-Integration-Id':'vscode-chat',
+                'X-Initiator':           'user',
+                'Openai-Intent':         'conversation-edits',
+            })
         req = request.Request(
             _join_url(self.config.base_url, '/chat/completions'),
             data=body,
-            headers={
-                'Authorization': f'Bearer {self.config.api_key}',
-                'Content-Type': 'application/json',
-            },
+            headers=headers,
             method='POST',
         )
         try:
-            with request.urlopen(req, timeout=self.config.timeout_seconds) as response:
+            with self._urlopen_with_dns_retry(req, timeout=self.config.timeout_seconds) as response:
                 raw = response.read()
         except error.HTTPError as exc:
             detail = exc.read().decode('utf-8', errors='replace')
@@ -254,9 +378,15 @@ class OpenAICompatClient:
         tools: list[dict[str, Any]],
         stream: bool,
         output_schema: OutputSchemaConfig | None,
+        model_override: str | None = None,
     ) -> dict[str, Any]:
+        # Inject cache_control on the system message so the backend (LiteLLM /
+        # Claude API) can cache the static system prompt across turns.
+        # We shallow-copy the list to avoid mutating the caller's messages.
+        messages = _inject_system_cache_control(messages)
+
         payload: dict[str, Any] = {
-            'model': self.config.model,
+            'model': model_override or self.config.model,
             'messages': messages,
             'tools': tools,
             'tool_choice': 'auto',
@@ -363,6 +493,14 @@ class OpenAICompatClient:
             delta = choice.get('delta')
             if not isinstance(delta, dict):
                 delta = {}
+            # Handle thinking blocks from o1/o3 models
+            thinking = delta.get('thinking')
+            if isinstance(thinking, str) and thinking:
+                yield StreamEvent(
+                    type='thinking_delta',
+                    delta=thinking,
+                    raw_event=choice,
+                )
             content = delta.get('content')
             if isinstance(content, str) and content:
                 yield StreamEvent(

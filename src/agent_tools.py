@@ -48,6 +48,7 @@ class ToolExecutionContext:
     max_output_chars: int
     permissions: AgentPermissions
     extra_env: dict[str, str] = field(default_factory=dict)
+    additional_roots: tuple[Path, ...] = ()
     tool_registry: dict[str, 'AgentTool'] | None = None
     search_runtime: 'SearchRuntime | None' = None
     account_runtime: 'AccountRuntime | None' = None
@@ -150,6 +151,9 @@ def build_tool_context(
         max_output_chars=config.max_output_chars,
         permissions=config.permissions,
         extra_env=dict(extra_env or {}),
+        additional_roots=tuple(
+            path.resolve() for path in config.additional_working_directories
+        ),
         tool_registry=tool_registry,
         search_runtime=search_runtime,
         account_runtime=account_runtime,
@@ -433,6 +437,37 @@ def default_tool_registry() -> dict[str, AgentTool]:
             handler=_tool_search,
         ),
         AgentTool(
+            name='recall_memory',
+            description=(
+                'Search Latti\'s persistent memory (scars, SOPs, lessons, decisions, '
+                'references at ~/.latti/memory/) by keyword. Use this BEFORE making a '
+                'decision that might match a prior correction or SOP — anchored '
+                'history is in your context window, but the typed memory store is not.'
+            ),
+            parameters={
+                'type': 'object',
+                'properties': {
+                    'query': {
+                        'type': 'string',
+                        'description': 'Keywords to match against memory body text. Tokens shorter than 3 chars are dropped.',
+                    },
+                    'kind': {
+                        'type': 'string',
+                        'enum': ['scar', 'sop', 'lesson', 'decision', 'reference'],
+                        'description': 'Filter to a specific memory kind. Omit for all kinds.',
+                    },
+                    'limit': {
+                        'type': 'integer',
+                        'minimum': 1,
+                        'maximum': 20,
+                        'description': 'Max results (default 5).',
+                    },
+                },
+                'required': ['query'],
+            },
+            handler=_recall_memory,
+        ),
+        AgentTool(
             name='sleep',
             description='Pause execution briefly for bounded local wait flows.',
             parameters={
@@ -551,7 +586,7 @@ def default_tool_registry() -> dict[str, AgentTool]:
                             {'type': 'number'},
                             {'type': 'integer'},
                             {'type': 'boolean'},
-                            {'type': 'array'},
+                            {'type': 'array', 'items': {}},
                             {'type': 'object'},
                             {'type': 'null'},
                         ]
@@ -1246,6 +1281,381 @@ def default_tool_registry() -> dict[str, AgentTool]:
             },
             handler=_execute_skill,
         ),
+        AgentTool(
+            name='lattice_solve',
+            description=(
+                'Solve any continuous optimization or minimization problem. '
+                'Use this whenever you need to: find the minimum/maximum of a function, '
+                'tune parameters to hit a target, search for optimal values in a range, '
+                'or answer "what values of X minimize Y?" questions. '
+                'Input: plain-English problem description. '
+                'Examples: "minimize x^2 + y^2 in [-5,5] x [-5,5]", '
+                '"find x in [0,10] that minimizes (x-3.7)^2", '
+                '"what weight w minimizes 0.4*error + w*cost for w in [0,1]?". '
+                'Returns: optimal point, minimum value, convergence status, solver diagnostics.'
+            ),
+            parameters={
+                'type': 'object',
+                'properties': {
+                    'problem': {
+                        'type': 'string',
+                        'description': 'The optimization problem in natural language or structured format.',
+                    },
+                    'samples': {
+                        'type': 'integer',
+                        'minimum': 1000,
+                        'maximum': 1000000,
+                        'description': 'Number of Monte Carlo samples (default: 10000).',
+                    },
+                },
+                'required': ['problem'],
+            },
+            handler=_lattice_solve,
+        ),
+        AgentTool(
+            name='lattice_boolean_solve',
+            description=(
+                'Make optimal yes/no decisions under constraints. '
+                'Use when you need to choose which options to activate/enable given costs and rules. '
+                'Examples: "should I use cache AND streaming, or just one? minimize cost with use_cache + use_stream <= 1", '
+                '"which 2 of these 5 features to enable to minimize latency?", '
+                '"model selection: pick cheapest model that meets quality threshold". '
+                'Returns: which variables to set to 1 (on) vs 0 (off), cost, feasibility, confidence.'
+            ),
+            parameters={
+                'type': 'object',
+                'properties': {
+                    'problem': {
+                        'type': 'string',
+                        'description': 'The boolean optimization problem in natural language format.',
+                    },
+                    'samples': {
+                        'type': 'integer',
+                        'minimum': 500,
+                        'maximum': 100000,
+                        'description': 'Number of MC samples (default: 5000).',
+                    },
+                },
+                'required': ['problem'],
+            },
+            handler=_lattice_boolean_solve,
+        ),
+        # ── Git tools ─────────────────────────────────────────────────────
+        AgentTool(
+            name='git_status',
+            description='Show working tree status: staged, unstaged, untracked files and current branch.',
+            parameters={'type': 'object', 'properties': {}},
+            handler=_git_status,
+        ),
+        AgentTool(
+            name='git_diff',
+            description='Show diff of unstaged changes, staged changes, or between two commits/branches.',
+            parameters={
+                'type': 'object',
+                'properties': {
+                    'staged': {'type': 'boolean', 'description': 'Show staged (--cached) diff.'},
+                    'path': {'type': 'string', 'description': 'Limit diff to this file or directory.'},
+                    'base': {'type': 'string', 'description': 'Base ref (commit/branch). Omit for working-tree diff.'},
+                    'head': {'type': 'string', 'description': 'Head ref (default HEAD).'},
+                    'max_lines': {'type': 'integer', 'minimum': 1, 'maximum': 2000, 'description': 'Truncate output (default 400).'},
+                },
+            },
+            handler=_git_diff,
+        ),
+        AgentTool(
+            name='git_log',
+            description='Show recent commit log with hash, author, date, message.',
+            parameters={
+                'type': 'object',
+                'properties': {
+                    'limit': {'type': 'integer', 'minimum': 1, 'maximum': 100, 'description': 'Number of commits (default 20).'},
+                    'path': {'type': 'string', 'description': 'Limit to commits touching this path.'},
+                    'oneline': {'type': 'boolean', 'description': 'One line per commit (default true).'},
+                },
+            },
+            handler=_git_log,
+        ),
+        AgentTool(
+            name='git_commit',
+            description='Stage all changed tracked files and create a commit. Never force-pushes. Refuses empty commits.',
+            parameters={
+                'type': 'object',
+                'properties': {
+                    'message': {'type': 'string', 'description': 'Commit message.'},
+                    'paths': {
+                        'type': 'array',
+                        'items': {'type': 'string'},
+                        'description': 'Specific paths to stage. Omit to stage all tracked changes (git add -u).',
+                    },
+                },
+                'required': ['message'],
+            },
+            handler=_git_commit,
+        ),
+        # ── File management ────────────────────────────────────────────────
+        AgentTool(
+            name='move_file',
+            description='Move or rename a file or directory inside the workspace.',
+            parameters={
+                'type': 'object',
+                'properties': {
+                    'source': {'type': 'string'},
+                    'destination': {'type': 'string'},
+                },
+                'required': ['source', 'destination'],
+            },
+            handler=_move_file,
+        ),
+        AgentTool(
+            name='delete_file',
+            description='Delete a file inside the workspace. Refuses to delete directories (use bash for that).',
+            parameters={
+                'type': 'object',
+                'properties': {
+                    'path': {'type': 'string'},
+                },
+                'required': ['path'],
+            },
+            handler=_delete_file,
+        ),
+        AgentTool(
+            name='make_dir',
+            description='Create a directory (and any missing parents) inside the workspace.',
+            parameters={
+                'type': 'object',
+                'properties': {
+                    'path': {'type': 'string'},
+                },
+                'required': ['path'],
+            },
+            handler=_make_dir,
+        ),
+        # ── Patch ──────────────────────────────────────────────────────────
+        AgentTool(
+            name='patch_file',
+            description=(
+                'Apply a unified diff patch to a workspace file. '
+                'Use when edit_file is impractical (many hunks, generated diffs). '
+                'Patch must be in unified diff format (--- a/  +++ b/  @@ hunks).'
+            ),
+            parameters={
+                'type': 'object',
+                'properties': {
+                    'path': {'type': 'string', 'description': 'Target file path (relative to workspace).'},
+                    'patch': {'type': 'string', 'description': 'Unified diff patch text.'},
+                    'fuzz': {'type': 'integer', 'minimum': 0, 'maximum': 3, 'description': 'Context fuzz factor (default 2).'},
+                },
+                'required': ['path', 'patch'],
+            },
+            handler=_patch_file,
+        ),
+        # ── Image read ─────────────────────────────────────────────────────
+        AgentTool(
+            name='image_read',
+            description=(
+                'Read an image file and return a base64-encoded data URI suitable for vision models. '
+                'Supports: png, jpg, jpeg, gif, webp. '
+                'Use to inspect screenshots, diagrams, charts, or UI mockups.'
+            ),
+            parameters={
+                'type': 'object',
+                'properties': {
+                    'path': {'type': 'string', 'description': 'Path to image file (absolute or relative to workspace).'},
+                },
+                'required': ['path'],
+            },
+            handler=_image_read,
+        ),
+        # ── Run tests ──────────────────────────────────────────────────────
+        AgentTool(
+            name='run_tests',
+            description=(
+                'Run the test suite (pytest by default) and return structured pass/fail/error results. '
+                'Supports pytest, unittest, and npm test. '
+                'Returns: total, passed, failed, errors, duration, and failed test names.'
+            ),
+            parameters={
+                'type': 'object',
+                'properties': {
+                    'path': {'type': 'string', 'description': 'Test file or directory (default: tests/).'},
+                    'pattern': {'type': 'string', 'description': 'pytest -k expression to filter tests.'},
+                    'runner': {'type': 'string', 'enum': ['pytest', 'unittest', 'npm'], 'description': 'Test runner (default: pytest).'},
+                    'timeout': {'type': 'integer', 'minimum': 5, 'maximum': 300, 'description': 'Timeout in seconds (default 60).'},
+                },
+            },
+            handler=_run_tests,
+        ),
+        # ── Memory ────────────────────────────────────────────────────────
+        AgentTool(
+            name='memory_write',
+            description=(
+                'Write a named memory entry that persists across turns and sessions. '
+                'Use for: decisions made, facts discovered, patterns noticed, things to remember. '
+                'Entries are stored in ~/.latti/memory/ as plain text.'
+            ),
+            parameters={
+                'type': 'object',
+                'properties': {
+                    'key': {'type': 'string', 'description': 'Memory key (slug, e.g. "db-schema", "user-prefs").'},
+                    'content': {'type': 'string', 'description': 'Content to store.'},
+                    'append': {'type': 'boolean', 'description': 'Append to existing entry instead of overwriting (default false).'},
+                },
+                'required': ['key', 'content'],
+            },
+            handler=_memory_write,
+        ),
+        AgentTool(
+            name='memory_read',
+            description='Read a named memory entry previously stored with memory_write. Returns content or empty string if not found.',
+            parameters={
+                'type': 'object',
+                'properties': {
+                    'key': {'type': 'string', 'description': 'Memory key to read.'},
+                },
+                'required': ['key'],
+            },
+            handler=_memory_read,
+        ),
+        AgentTool(
+            name='memory_list',
+            description='List all memory keys stored with memory_write.',
+            parameters={'type': 'object', 'properties': {}},
+            handler=_memory_list,
+        ),
+        AgentTool(
+            name='self_score',
+            description=(
+                'Score your own response quality. Pass the text of your response '
+                'and get a 0-100 score based on: tool usage (+20), conciseness (+10), '
+                'no anti-patterns (+10), no trailing questions (+10), no permission asking (+10). '
+                'Use this BEFORE finalizing a response to check if you should revise it. '
+                'A score below 60 means the response needs work.'
+            ),
+            parameters={
+                'type': 'object',
+                'properties': {
+                    'response_text': {
+                        'type': 'string',
+                        'description': 'The response text to evaluate.',
+                    },
+                    'used_tools': {
+                        'type': 'boolean',
+                        'description': 'Whether tools were called during this response.',
+                    },
+                },
+                'required': ['response_text'],
+            },
+            handler=_self_score,
+        ),
+        AgentTool(
+            name='lattice_sector_solve',
+            description=(
+                'Decompose an optimization into independent sectors and combine via log-odds product '
+                '(Bayesian update). Based on Observer-Patch Holography: each sector is an independent '
+                'observer patch. Results combine multiplicatively in log-odds space, not by averaging. '
+                'Input: JSON object mapping sector names to cost function expressions, plus bounds. '
+                'Example: sectors={"distance": "x0^2+x1^2", "penalty": "(x0-3)^2"}, bounds="[-5,5] x [-5,5]". '
+                'Returns combined optimum, per-sector results, and consensus score.'
+            ),
+            parameters={
+                'type': 'object',
+                'properties': {
+                    'sectors': {
+                        'type': 'object',
+                        'description': 'Map of sector name to cost function expression (using x0, x1, ...).',
+                        'additionalProperties': {'type': 'string'},
+                    },
+                    'bounds': {
+                        'type': 'string',
+                        'description': 'Bounds in bracket format: "[-5,5] x [-5,5]".',
+                    },
+                    'samples': {
+                        'type': 'integer',
+                        'minimum': 1000,
+                        'maximum': 100000,
+                        'description': 'Monte Carlo samples per sector (default: 5000).',
+                    },
+                },
+                'required': ['sectors', 'bounds'],
+            },
+            handler=_lattice_sector_solve,
+        ),
+        AgentTool(
+            name='lattice_maxent',
+            description=(
+                'Find the maximum-entropy distribution subject to constraints. Based on OPH Lemma 2.6: '
+                'the Gibbs state p(x) ~ exp(-sum lambda_i O_i(x)) is the unique entropy-maximizing answer. '
+                'Input: list of constraints as {name, expression, target} objects, plus bounds. '
+                'Example: constraints=[{"name":"mean_x","expr":"x0","target":3.0}], bounds="[0,10]". '
+                'Returns Lagrange multipliers, constraint errors, and entropy estimate.'
+            ),
+            parameters={
+                'type': 'object',
+                'properties': {
+                    'constraints': {
+                        'type': 'array',
+                        'items': {
+                            'type': 'object',
+                            'properties': {
+                                'name': {'type': 'string'},
+                                'expr': {'type': 'string', 'description': 'Observable expression using x0, x1, ...'},
+                                'target': {'type': 'number', 'description': 'Target expected value <O_i>.'},
+                            },
+                            'required': ['name', 'expr', 'target'],
+                        },
+                        'description': 'List of (name, observable_expression, target_value) constraints.',
+                    },
+                    'bounds': {
+                        'type': 'string',
+                        'description': 'Bounds in bracket format: "[0,10] x [0,10]".',
+                    },
+                    'samples': {
+                        'type': 'integer',
+                        'minimum': 1000,
+                        'maximum': 100000,
+                        'description': 'Monte Carlo samples (default: 5000).',
+                    },
+                },
+                'required': ['constraints', 'bounds'],
+            },
+            handler=_lattice_maxent,
+        ),
+        AgentTool(
+            name='lattice_nn_predict',
+            description=(
+                'Predict using the lattice neural network — Monte Carlo as hidden layer. '
+                'No gradient descent; the MC sampling IS the computation. '
+                'Input: feature dict (name->value), optional model_path to load saved weights. '
+                'For training: pass features + outcome (0 or 1). '
+                'Returns predicted probability, confidence, and per-feature contributions.'
+            ),
+            parameters={
+                'type': 'object',
+                'properties': {
+                    'features': {
+                        'type': 'object',
+                        'description': 'Feature name to value mapping.',
+                        'additionalProperties': {'type': 'number'},
+                    },
+                    'outcome': {
+                        'type': 'number',
+                        'description': 'If provided (0 or 1), train on this outcome after predicting.',
+                    },
+                    'model_path': {
+                        'type': 'string',
+                        'description': 'Path to load/save model weights (JSON). Optional.',
+                    },
+                    'samples': {
+                        'type': 'integer',
+                        'minimum': 500,
+                        'maximum': 50000,
+                        'description': 'Monte Carlo samples (default: 2000).',
+                    },
+                },
+                'required': ['features'],
+            },
+            handler=_lattice_nn_predict,
+        ),
     ]
     return {tool.name: tool for tool in tools}
 
@@ -1297,17 +1707,31 @@ def _coerce_float(arguments: dict[str, Any], key: str, default: float) -> float:
     return float(value)
 
 
+def _relative_to_any_root(path: Path, context: ToolExecutionContext) -> Path:
+    """Return a relative path against the primary root or any additional root."""
+    for root in (context.root, *context.additional_roots):
+        try:
+            return path.relative_to(root)
+        except ValueError:
+            continue
+    return path
+
+
 def _resolve_path(raw_path: str, context: ToolExecutionContext, *, allow_missing: bool = True) -> Path:
     expanded = Path(raw_path).expanduser()
     candidate = expanded if expanded.is_absolute() else context.root / expanded
     resolved = candidate.resolve(strict=not allow_missing)
-    try:
-        resolved.relative_to(context.root)
-    except ValueError as exc:
-        raise ToolExecutionError(
-            f'Path {raw_path!r} escapes the workspace root {context.root}'
-        ) from exc
-    return resolved
+    # Check primary root first, then additional roots
+    allowed_roots = (context.root, *context.additional_roots)
+    for root in allowed_roots:
+        try:
+            resolved.relative_to(root)
+            return resolved
+        except ValueError:
+            continue
+    raise ToolExecutionError(
+        f'Path {raw_path!r} escapes the workspace root {context.root}'
+    )
 
 
 def _ensure_write_allowed(context: ToolExecutionContext) -> None:
@@ -1358,7 +1782,7 @@ def _list_dir(arguments: dict[str, Any], context: ToolExecutionContext) -> str:
     lines: list[str] = []
     for entry in entries[:max_entries]:
         kind = 'dir' if entry.is_dir() else 'file'
-        rel = entry.relative_to(context.root)
+        rel = _relative_to_any_root(entry, context)
         lines.append(f'{kind}\t{rel}')
     if len(entries) > max_entries:
         lines.append(f'... truncated at {max_entries} entries ...')
@@ -1497,10 +1921,84 @@ def _self_authored_warning(target: Path, context: ToolExecutionContext) -> str:
 
 
 def _read_file(arguments: dict[str, Any], context: ToolExecutionContext) -> str:
+    import base64
+    import struct
+
     target = _resolve_path(_require_string(arguments, 'path'), context, allow_missing=False)
     _refuse_if_secret_bearing(target)
     if not target.is_file():
         raise ToolExecutionError(f'Path is not a file: {target}')
+
+    suffix = target.suffix.lower()
+
+    # --- Image handling ---
+    IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.gif', '.webp'}
+    if suffix in IMAGE_EXTENSIONS:
+        raw = target.read_bytes()
+        b64 = base64.b64encode(raw).decode('ascii')
+        # Best-effort width/height detection without PIL
+        dimensions = ''
+        try:
+            if suffix == '.png' and raw[:8] == b'\x89PNG\r\n\x1a\n':
+                w, h = struct.unpack('>II', raw[16:24])
+                dimensions = f', {w}x{h}'
+            elif suffix in ('.jpg', '.jpeg') and raw[:2] == b'\xff\xd8':
+                # Walk JPEG segments to find SOF marker
+                i = 2
+                while i < len(raw) - 8:
+                    if raw[i] != 0xFF:
+                        break
+                    marker = raw[i + 1]
+                    seg_len = struct.unpack('>H', raw[i + 2:i + 4])[0]
+                    # SOF0-SOF3 (0xC0-0xC3) contain dimensions
+                    if 0xC0 <= marker <= 0xC3:
+                        h, w = struct.unpack('>HH', raw[i + 5:i + 9])
+                        dimensions = f', {w}x{h}'
+                        break
+                    i += 2 + seg_len
+            elif suffix == '.webp' and raw[:4] == b'RIFF' and raw[8:12] == b'WEBP':
+                # VP8 lossy: chunk 'VP8 '
+                if raw[12:16] == b'VP8 ':
+                    w = (struct.unpack('<H', raw[26:28])[0]) & 0x3FFF
+                    h = (struct.unpack('<H', raw[28:30])[0]) & 0x3FFF
+                    dimensions = f', {w}x{h}'
+                # VP8L lossless: chunk 'VP8L'
+                elif raw[12:16] == b'VP8L':
+                    bits = struct.unpack('<I', raw[21:25])[0]
+                    w = (bits & 0x3FFF) + 1
+                    h = ((bits >> 14) & 0x3FFF) + 1
+                    dimensions = f', {w}x{h}'
+        except Exception:
+            pass
+        header = f'[Image: {target.name}{dimensions}, {len(b64)} base64 bytes]\n'
+        return _truncate_output(header + b64, context.max_output_chars)
+
+    # --- PDF handling ---
+    if suffix == '.pdf':
+        # Try pdftotext first (poppler, usually available on macOS via brew or system)
+        try:
+            result = subprocess.run(
+                ['pdftotext', str(target), '-'],
+                capture_output=True,
+                timeout=30,
+            )
+            if result.returncode == 0:
+                text = result.stdout.decode('utf-8', errors='replace')
+                return _truncate_output(
+                    f'[PDF: {target.name}, extracted via pdftotext]\n{text}',
+                    context.max_output_chars,
+                )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+        # Fallback: extract printable ASCII strings from raw bytes (like `strings`)
+        raw = target.read_bytes()
+        printable = re.findall(rb'[ -~\t\n\r]{4,}', raw)
+        extracted = b'\n'.join(printable).decode('ascii', errors='replace')
+        return _truncate_output(
+            f'[PDF: {target.name}, {len(raw)} bytes — pdftotext unavailable, extracted strings]\n{extracted}',
+            context.max_output_chars,
+        )
+
     text = target.read_text(encoding='utf-8', errors='replace')
     self_warning = _self_authored_warning(target, context)
     start_line = arguments.get('start_line')
@@ -1519,6 +2017,37 @@ def _read_file(arguments: dict[str, Any], context: ToolExecutionContext) -> str:
     return _truncate_output(self_warning + rendered, context.max_output_chars)
 
 
+_LATTI_GATE_PATTERNS = [
+    'run all', 'run every session', 'check automatically',
+    'before responding', 'on first message',
+    'these are not optional', 'run these on',
+]
+_LATTI_GATE_ALLOWED_MD = {'ARCHITECTURE.md', 'AUTONOMY.md', 'MEMORY.md', 'README.md'}
+
+
+def _latti_gate_check(filepath: str, content: str) -> str:
+    """Check if a write to ~/.latti/ is instructions that should be code. Returns warning or empty."""
+    latti_home = os.path.expanduser('~/.latti')
+    if not filepath.startswith(latti_home):
+        return ''
+    if '/memory/' in filepath:
+        return ''  # memory files are the learning loop
+    if not filepath.endswith('.md'):
+        return ''  # .py, .sh, .json are fine
+    if os.path.basename(filepath) in _LATTI_GATE_ALLOWED_MD:
+        return ''
+    content_lower = content.lower()
+    for pattern in _LATTI_GATE_PATTERNS:
+        if pattern in content_lower:
+            return (
+                f'LATTI GATE: This file contains instruction pattern "{pattern}". '
+                f'Consider writing a Python function in latti_boot.py instead. '
+                f'Gate: 1→function in latti_boot.py, 2→tool in agent_tools.py, '
+                f'3→string in gather_boot_context(), 4→STOP creating .md instructions.'
+            )
+    return ''
+
+
 def _write_file(arguments: dict[str, Any], context: ToolExecutionContext) -> str:
     _ensure_write_allowed(context)
     target = _resolve_path(_require_string(arguments, 'path'), context)
@@ -1534,10 +2063,15 @@ def _write_file(arguments: dict[str, Any], context: ToolExecutionContext) -> str
         previous_sha256 = hashlib.sha256(previous_text.encode('utf-8')).hexdigest()
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(content, encoding='utf-8')
-    rel = target.relative_to(context.root)
+    rel = _relative_to_any_root(target, context)
     new_sha256 = hashlib.sha256(content.encode('utf-8')).hexdigest()
+    # Latti gate: warn if writing instruction .md to ~/.latti/
+    _gate_warning = _latti_gate_check(str(target), content)
+    _wrote_msg = f'wrote {rel} ({len(content)} chars)'
+    if _gate_warning:
+        _wrote_msg += f'\n\n⚠ {_gate_warning}'
     return (
-        f'wrote {rel} ({len(content)} chars)',
+        _wrote_msg,
         {
             'action': 'write_file',
             'path': str(rel),
@@ -1584,7 +2118,7 @@ def _edit_file(arguments: dict[str, Any], context: ToolExecutionContext) -> str:
     before_sha256 = hashlib.sha256(current.encode('utf-8')).hexdigest()
     updated = current.replace(old_text, new_text) if replace_all else current.replace(old_text, new_text, 1)
     target.write_text(updated, encoding='utf-8')
-    rel = target.relative_to(context.root)
+    rel = _relative_to_any_root(target, context)
     replaced = occurrences if replace_all else 1
     after_sha256 = hashlib.sha256(updated.encode('utf-8')).hexdigest()
     return (
@@ -1668,7 +2202,7 @@ def _notebook_edit(arguments: dict[str, Any], context: ToolExecutionContext) -> 
     updated = json.dumps(notebook, ensure_ascii=True, indent=1) + '\n'
     target.write_text(updated, encoding='utf-8')
     after_sha256 = hashlib.sha256(updated.encode('utf-8')).hexdigest()
-    rel = target.relative_to(context.root)
+    rel = _relative_to_any_root(target, context)
     return (
         f'updated notebook cell {cell_index} in {rel}',
         {
@@ -1696,7 +2230,7 @@ def _glob_search(arguments: dict[str, Any], context: ToolExecutionContext) -> st
             path.resolve().relative_to(root_resolved)
         except ValueError:
             continue
-        validated.append(str(path.relative_to(context.root)))
+        validated.append(str(_relative_to_any_root(path, context)))
     if not validated:
         return '(no matches)'
     return _truncate_output('\n'.join(validated), context.max_output_chars)
@@ -1736,7 +2270,7 @@ def _grep_search(arguments: dict[str, Any], context: ToolExecutionContext) -> st
             continue
         for line_no, line in enumerate(text.splitlines(), start=1):
             if regex.search(line):
-                rel = file_path.relative_to(context.root)
+                rel = _relative_to_any_root(file_path, context)
                 hits.append(f'{rel}:{line_no}: {line}')
                 if len(hits) >= max_matches:
                     return '\n'.join(hits + [f'... truncated at {max_matches} matches ...'])
@@ -2030,6 +2564,61 @@ def _tool_search(arguments: dict[str, Any], context: ToolExecutionContext) -> st
     for name, description in matches[:max_results]:
         lines.append(f'- `{name}`: {description}')
     return '\n'.join(lines)
+
+
+def _recall_memory(arguments: dict[str, Any], context: ToolExecutionContext) -> str:
+    """Search Latti's persistent memory for relevant scars/SOPs/lessons.
+
+    Routes (query, kind, limit) into LattiMemoryStore.recall over the
+    memory directory at LATTI_MEMORY_DIR (default ~/.latti/memory).
+    Returns a formatted text block the LLM can read; empty matches
+    return an explicit "no matching memories" sentence rather than an
+    empty string (so the LLM doesn't misread silence as an error).
+
+    Tested by tests/test_recall_memory_tool.py + test_memory_recall.py.
+    """
+    del context  # tool reads from filesystem, not workspace context
+    query = _require_string(arguments, 'query').strip()
+    if not query:
+        return 'No query provided.'
+    kind = arguments.get('kind') if isinstance(arguments.get('kind'), str) else None
+    limit = _coerce_int(arguments, 'limit', 5)
+    if limit < 1:
+        limit = 1
+    if limit > 20:
+        limit = 20
+
+    memory_dir_override = os.environ.get('LATTI_MEMORY_DIR')
+    memory_dir = (
+        Path(memory_dir_override)
+        if memory_dir_override
+        else Path.home() / '.latti' / 'memory'
+    )
+    if not memory_dir.exists():
+        return 'No matching memories found (memory directory does not exist).'
+
+    try:
+        from .state_machine_memory import LattiMemoryStore
+        store = LattiMemoryStore(memory_dir)
+        results = store.recall(query, kind=kind, limit=limit)  # type: ignore[arg-type]
+    except Exception as exc:
+        return f'Memory recall failed: {exc!r}'
+
+    if not results:
+        return f'No matching memories found for query={query!r} kind={kind or "any"}.'
+
+    lines = [f'# Memory recall — {len(results)} match(es) for {query!r}']
+    if kind:
+        lines.append(f'(filtered to kind={kind})')
+    lines.append('')
+    for rec in results:
+        lines.append(f'## [{rec.kind}] {rec.id}')
+        body_preview = rec.body.strip()
+        if len(body_preview) > 600:
+            body_preview = body_preview[:597] + '...'
+        lines.append(body_preview)
+        lines.append('')
+    return '\n'.join(lines).rstrip() + '\n'
 
 
 def _sleep(arguments: dict[str, Any], context: ToolExecutionContext) -> str:
@@ -3273,6 +3862,207 @@ def _execute_skill(
     )
 
 
+def _self_score(arguments: dict[str, Any], context: ToolExecutionContext) -> str:
+    """Score own response quality — reward model for self-evaluation."""
+    text = arguments.get('response_text', '')
+    used_tools = arguments.get('used_tools', False)
+    score = 50  # baseline
+
+    if used_tools:
+        score += 20
+
+    # Conciseness: under 15 lines
+    lines = [l for l in text.split('\n') if l.strip()]
+    if len(lines) <= 15:
+        score += 10
+
+    # Anti-pattern checks
+    import re
+    text_lower = text.lower()
+    if re.search(r'great question|that.s interesting|as an ai|i find that', text_lower):
+        score -= 15
+    if text.rstrip().endswith('?'):
+        score -= 10
+    if re.search(r'shall i|should i|would you like|do you want|can i proceed', text_lower):
+        score -= 10
+    if re.search(r'what would you|standing by|your call|let me know', text_lower):
+        score -= 10
+
+    # Bonus for action-oriented language
+    if re.search(r'done|fixed|saved|created|computed|result', text_lower):
+        score += 10
+
+    score = max(0, min(100, score))
+
+    verdict = 'GOOD' if score >= 70 else 'REVISE' if score >= 50 else 'POOR'
+    feedback = []
+    if not used_tools:
+        feedback.append('Consider using a tool instead of just explaining')
+    if len(lines) > 15:
+        feedback.append(f'Too verbose ({len(lines)} lines, aim for <15)')
+    if score < 70:
+        feedback.append('Check for anti-patterns: filler, trailing questions, permission asking')
+
+    return f'Score: {score}/100 ({verdict})\n' + ('\n'.join(f'- {f}' for f in feedback) if feedback else 'No issues detected.')
+
+
+def _lattice_solve(
+    arguments: dict[str, Any],
+    context: ToolExecutionContext,
+) -> str:
+    problem = arguments.get('problem', '')
+    if not isinstance(problem, str) or not problem.strip():
+        raise ToolExecutionError('problem must be a non-empty string')
+
+    samples = arguments.get('samples', 10000)
+    if not isinstance(samples, int):
+        samples = 10000
+    samples = max(1000, min(1000000, samples))
+
+    from .lattice_solver import parse_and_solve
+    return parse_and_solve(problem, samples)
+
+
+def _lattice_boolean_solve(
+    arguments: dict[str, Any],
+    context: ToolExecutionContext,
+) -> str:
+    problem = arguments.get('problem', '')
+    if not isinstance(problem, str) or not problem.strip():
+        raise ToolExecutionError('problem must be a non-empty string')
+
+    samples = arguments.get('samples', 5000)
+    if not isinstance(samples, int):
+        samples = 5000
+    samples = max(500, min(100000, samples))
+
+    from .lattice_boolean_solve import parse_and_boolean_solve
+    return parse_and_boolean_solve(problem, samples)
+
+
+def _lattice_sector_solve(
+    arguments: dict[str, Any],
+    context: ToolExecutionContext,
+) -> str:
+    sectors_raw = arguments.get('sectors', {})
+    if not isinstance(sectors_raw, dict) or not sectors_raw:
+        raise ToolExecutionError('sectors must be a non-empty object mapping names to expressions')
+
+    bounds_str = arguments.get('bounds', '')
+    if not isinstance(bounds_str, str) or not bounds_str.strip():
+        raise ToolExecutionError('bounds must be a non-empty string like "[-5,5] x [-5,5]"')
+
+    samples = arguments.get('samples', 5000)
+    if not isinstance(samples, int):
+        samples = 5000
+    samples = max(1000, min(100000, samples))
+
+    from .lattice_solver import _extract_bounds, _build_cost_fn
+    bounds = _extract_bounds(bounds_str)
+    if not bounds:
+        raise ToolExecutionError(f'Could not parse bounds from: {bounds_str}')
+
+    dims = len(bounds)
+    sector_fns = {}
+    for name, expr in sectors_raw.items():
+        fn = _build_cost_fn(expr, dims)
+        if fn is None:
+            raise ToolExecutionError(f'Sector "{name}": expression does not reference x0..x{dims-1}: {expr}')
+        sector_fns[name] = fn
+
+    from .lattice_sectors import SectorSolver
+    solver = SectorSolver(sector_fns)
+    result = solver.solve(bounds, samples)
+    return f'Sector Decomposition ({len(sector_fns)} sectors, {dims}D)\n{"="*50}\n{result.to_text()}'
+
+
+def _lattice_maxent(
+    arguments: dict[str, Any],
+    context: ToolExecutionContext,
+) -> str:
+    constraints_raw = arguments.get('constraints', [])
+    if not isinstance(constraints_raw, list) or not constraints_raw:
+        raise ToolExecutionError('constraints must be a non-empty list of {name, expr, target} objects')
+
+    bounds_str = arguments.get('bounds', '')
+    if not isinstance(bounds_str, str) or not bounds_str.strip():
+        raise ToolExecutionError('bounds must be a non-empty string like "[0,10] x [0,10]"')
+
+    samples = arguments.get('samples', 5000)
+    if not isinstance(samples, int):
+        samples = 5000
+    samples = max(1000, min(100000, samples))
+
+    from .lattice_solver import _extract_bounds, _build_cost_fn
+    bounds = _extract_bounds(bounds_str)
+    if not bounds:
+        raise ToolExecutionError(f'Could not parse bounds from: {bounds_str}')
+
+    dims = len(bounds)
+    constraints = []
+    for c in constraints_raw:
+        name = c.get('name', '')
+        expr = c.get('expr', '')
+        target = c.get('target', 0.0)
+        if not name or not expr:
+            raise ToolExecutionError(f'Each constraint needs name and expr, got: {c}')
+        fn = _build_cost_fn(expr, dims)
+        if fn is None:
+            raise ToolExecutionError(f'Constraint "{name}": expression does not reference x0..x{dims-1}: {expr}')
+        constraints.append((name, fn, float(target)))
+
+    from .lattice_maxent import maxent_solve
+    result = maxent_solve(constraints, bounds, samples)
+    return f'MaxEnt Constraint Solver ({len(constraints)} constraints, {dims}D)\n{"="*50}\n{result.to_text()}'
+
+
+def _lattice_nn_predict(
+    arguments: dict[str, Any],
+    context: ToolExecutionContext,
+) -> str:
+    features = arguments.get('features', {})
+    if not isinstance(features, dict) or not features:
+        raise ToolExecutionError('features must be a non-empty object mapping names to numbers')
+
+    # Ensure values are floats
+    for k, v in features.items():
+        if not isinstance(v, (int, float)):
+            raise ToolExecutionError(f'Feature "{k}" must be a number, got {type(v).__name__}')
+    features = {k: float(v) for k, v in features.items()}
+
+    outcome = arguments.get('outcome')
+    model_path = arguments.get('model_path')
+    samples = arguments.get('samples', 2000)
+    if not isinstance(samples, int):
+        samples = 2000
+    samples = max(500, min(50000, samples))
+
+    from .lattice_nn import LatticeNN
+    feature_names = sorted(features.keys())
+    nn = LatticeNN(feature_names)
+
+    # Load saved weights if path provided
+    if model_path and os.path.exists(model_path):
+        nn.load(model_path)
+
+    result = nn.predict(features, samples)
+    output = f'Lattice Neural Network ({len(feature_names)} features)\n{"="*50}\n{result.to_text()}'
+
+    # Train if outcome provided
+    if outcome is not None:
+        outcome_val = float(outcome)
+        nn.train(features, outcome_val)
+        output += f'\n\nTrained on outcome={outcome_val:.2f} (error={abs(outcome_val - result.probability):.4f})'
+
+    # Save if path provided
+    if model_path:
+        nn.save(model_path)
+        output += f'\nModel saved to {model_path}'
+
+    output += f'\n\n{nn.status()}'
+    return output
+
+
 def _lsp_query(arguments: dict[str, Any], context: ToolExecutionContext):
     runtime = _require_lsp_runtime(context)
     operation = _require_string(arguments, 'operation')
@@ -3585,3 +4375,347 @@ def _stream_static_text_result(
             metadata=metadata,
         ),
     )
+
+
+# =============================================================================
+# New tool handlers — git, file-management, patch, image, run_tests, memory
+# =============================================================================
+
+import base64 as _base64
+import pathlib as _pathlib
+import re as _re
+import shutil as _shutil
+import subprocess as _subprocess
+import tempfile as _tempfile
+
+
+def _cwd(context: ToolExecutionContext) -> _pathlib.Path:
+    """Return the workspace root as a Path."""
+    return _pathlib.Path(getattr(context, 'cwd', '.') or '.').resolve()
+
+
+def _safe_path(context: ToolExecutionContext, rel: str) -> _pathlib.Path:
+    """Resolve rel relative to workspace and verify it stays inside."""
+    base = _cwd(context)
+    p = (base / rel).resolve()
+    if not str(p).startswith(str(base)):
+        raise ToolExecutionError(f'Path escapes workspace: {rel}')
+    return p
+
+
+# ---------------------------------------------------------------------------
+# Git tools
+# ---------------------------------------------------------------------------
+
+def _git_run(args: list[str], cwd: _pathlib.Path, timeout: int = 30) -> tuple[int, str]:
+    """Run a git command; return (returncode, combined stdout+stderr)."""
+    try:
+        r = _subprocess.run(
+            ['git'] + args,
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        out = (r.stdout or '') + (r.stderr or '')
+        return r.returncode, out.strip()
+    except FileNotFoundError:
+        return 1, 'git not found in PATH'
+    except _subprocess.TimeoutExpired:
+        return 1, f'git timed out after {timeout}s'
+
+
+def _git_status(arguments: dict[str, Any], context: ToolExecutionContext) -> str:
+    cwd = _cwd(context)
+    rc, branch = _git_run(['branch', '--show-current'], cwd)
+    rc2, out = _git_run(['status', '--short', '--branch'], cwd)
+    if rc2 != 0:
+        raise ToolExecutionError(f'git status failed: {out}')
+    return out if out else 'working tree clean'
+
+
+def _git_diff(arguments: dict[str, Any], context: ToolExecutionContext) -> str:
+    cwd       = _cwd(context)
+    staged    = arguments.get('staged', False)
+    path      = arguments.get('path', '')
+    base      = arguments.get('base', '')
+    head      = arguments.get('head', 'HEAD')
+    max_lines = int(arguments.get('max_lines', 400))
+
+    args = ['diff']
+    if staged:
+        args.append('--cached')
+    if base:
+        args += [f'{base}..{head}']
+    args += ['--']
+    if path:
+        args.append(path)
+
+    rc, out = _git_run(args, cwd)
+    if rc != 0:
+        raise ToolExecutionError(f'git diff failed: {out}')
+    if not out:
+        return 'no differences'
+    lines = out.splitlines()
+    if len(lines) > max_lines:
+        out = '\n'.join(lines[:max_lines]) + f'\n… ({len(lines) - max_lines} more lines truncated)'
+    return out
+
+
+def _git_log(arguments: dict[str, Any], context: ToolExecutionContext) -> str:
+    cwd     = _cwd(context)
+    limit   = int(arguments.get('limit', 20))
+    path    = arguments.get('path', '')
+    oneline = arguments.get('oneline', True)
+
+    args = ['log', f'-{limit}']
+    if oneline:
+        args.append('--oneline')
+    else:
+        args += ['--pretty=format:%h %an %ar  %s']
+    args += ['--']
+    if path:
+        args.append(path)
+
+    rc, out = _git_run(args, cwd)
+    if rc != 0:
+        raise ToolExecutionError(f'git log failed: {out}')
+    return out if out else 'no commits'
+
+
+def _git_commit(arguments: dict[str, Any], context: ToolExecutionContext) -> str:
+    cwd     = _cwd(context)
+    message = arguments.get('message', '').strip()
+    paths   = arguments.get('paths') or []
+
+    if not message:
+        raise ToolExecutionError('commit message is required')
+
+    # Stage
+    if paths:
+        for p in paths:
+            rc, out = _git_run(['add', '--', p], cwd)
+            if rc != 0:
+                raise ToolExecutionError(f'git add {p} failed: {out}')
+    else:
+        rc, out = _git_run(['add', '-u'], cwd)
+        if rc != 0:
+            raise ToolExecutionError(f'git add -u failed: {out}')
+
+    # Check something is staged
+    rc, staged = _git_run(['diff', '--cached', '--name-only'], cwd)
+    if not staged.strip():
+        return 'nothing to commit (no tracked changes staged)'
+
+    # Commit
+    rc, out = _git_run(['commit', '-m', message], cwd)
+    if rc != 0:
+        raise ToolExecutionError(f'git commit failed: {out}')
+    return out
+
+
+# ---------------------------------------------------------------------------
+# File management
+# ---------------------------------------------------------------------------
+
+def _move_file(arguments: dict[str, Any], context: ToolExecutionContext) -> str:
+    src  = _safe_path(context, arguments['source'])
+    dest = _safe_path(context, arguments['destination'])
+    if not src.exists():
+        raise ToolExecutionError(f'source does not exist: {arguments["source"]}')
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    _shutil.move(str(src), str(dest))
+    return f'moved {arguments["source"]} → {arguments["destination"]}'
+
+
+def _delete_file(arguments: dict[str, Any], context: ToolExecutionContext) -> str:
+    p = _safe_path(context, arguments['path'])
+    if not p.exists():
+        raise ToolExecutionError(f'file not found: {arguments["path"]}')
+    if p.is_dir():
+        raise ToolExecutionError('delete_file refuses directories — use bash rm -rf if intentional')
+    p.unlink()
+    return f'deleted {arguments["path"]}'
+
+
+def _make_dir(arguments: dict[str, Any], context: ToolExecutionContext) -> str:
+    p = _safe_path(context, arguments['path'])
+    p.mkdir(parents=True, exist_ok=True)
+    return f'created {arguments["path"]}'
+
+
+# ---------------------------------------------------------------------------
+# Patch
+# ---------------------------------------------------------------------------
+
+def _patch_file(arguments: dict[str, Any], context: ToolExecutionContext) -> str:
+    """Apply a unified diff patch using the `patch` CLI."""
+    path  = _safe_path(context, arguments['path'])
+    patch = arguments.get('patch', '')
+    fuzz  = int(arguments.get('fuzz', 2))
+
+    if not patch.strip():
+        raise ToolExecutionError('patch is empty')
+    if not path.exists():
+        raise ToolExecutionError(f'target file not found: {arguments["path"]}')
+
+    # Write patch to temp file
+    with _tempfile.NamedTemporaryFile(mode='w', suffix='.patch', delete=False) as tf:
+        tf.write(patch)
+        patch_path = tf.name
+
+    try:
+        r = _subprocess.run(
+            ['patch', f'--fuzz={fuzz}', '--forward', str(path), patch_path],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        out = (r.stdout or '') + (r.stderr or '')
+        if r.returncode != 0:
+            raise ToolExecutionError(f'patch failed: {out.strip()}')
+        return out.strip() or f'patch applied to {arguments["path"]}'
+    finally:
+        _pathlib.Path(patch_path).unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# Image read
+# ---------------------------------------------------------------------------
+
+_SUPPORTED_IMAGE_TYPES = {'.png', '.jpg', '.jpeg', '.gif', '.webp'}
+_IMAGE_MIME = {
+    '.png':  'image/png',
+    '.jpg':  'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.gif':  'image/gif',
+    '.webp': 'image/webp',
+}
+_MAX_IMAGE_BYTES = 5 * 1024 * 1024  # 5 MB
+
+
+def _image_read(arguments: dict[str, Any], context: ToolExecutionContext) -> str:
+    raw = arguments.get('path', '')
+    # Allow absolute paths (screenshots outside workspace)
+    p = _pathlib.Path(raw).expanduser().resolve()
+    if not p.exists():
+        # Try workspace-relative
+        try:
+            p = _safe_path(context, raw)
+        except Exception:
+            pass
+    if not p.exists():
+        raise ToolExecutionError(f'image not found: {raw}')
+
+    ext = p.suffix.lower()
+    if ext not in _SUPPORTED_IMAGE_TYPES:
+        raise ToolExecutionError(f'unsupported image type {ext}. Supported: {", ".join(_SUPPORTED_IMAGE_TYPES)}')
+
+    size = p.stat().st_size
+    if size > _MAX_IMAGE_BYTES:
+        raise ToolExecutionError(f'image too large ({size // 1024}KB > 5MB limit)')
+
+    mime    = _IMAGE_MIME[ext]
+    data    = _base64.b64encode(p.read_bytes()).decode()
+    data_uri = f'data:{mime};base64,{data}'
+    return (
+        f'image:{p.name} ({size // 1024}KB {mime})\n'
+        f'data_uri:{data_uri}'
+    )
+
+
+# ---------------------------------------------------------------------------
+# Run tests
+# ---------------------------------------------------------------------------
+
+def _run_tests(arguments: dict[str, Any], context: ToolExecutionContext) -> str:
+    cwd     = _cwd(context)
+    path    = arguments.get('path', 'tests/')
+    pattern = arguments.get('pattern', '')
+    runner  = arguments.get('runner', 'pytest')
+    timeout = int(arguments.get('timeout', 60))
+
+    if runner == 'pytest':
+        cmd = ['python3', '-m', 'pytest', '-v', '--tb=short', '--no-header', '-q']
+        if pattern:
+            cmd += ['-k', pattern]
+        cmd.append(path)
+    elif runner == 'unittest':
+        cmd = ['python3', '-m', 'unittest', 'discover', path]
+    elif runner == 'npm':
+        cmd = ['npm', 'test', '--', '--watchAll=false']
+    else:
+        raise ToolExecutionError(f'unknown runner: {runner}')
+
+    try:
+        r = _subprocess.run(
+            cmd, cwd=str(cwd),
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except _subprocess.TimeoutExpired:
+        raise ToolExecutionError(f'tests timed out after {timeout}s')
+    except FileNotFoundError as e:
+        raise ToolExecutionError(f'runner not found: {e}')
+
+    out = (r.stdout or '') + (r.stderr or '')
+
+    # Parse pytest summary line
+    summary = ''
+    for line in reversed(out.splitlines()):
+        if _re.search(r'\d+ passed|\d+ failed|\d+ error', line):
+            summary = line.strip()
+            break
+
+    status = 'PASS' if r.returncode == 0 else 'FAIL'
+    result = f'{status}  {summary}\n\n{out[-3000:]}' if len(out) > 3000 else f'{status}  {summary}\n\n{out}'
+    if r.returncode != 0:
+        raise ToolExecutionError(result)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Memory
+# ---------------------------------------------------------------------------
+
+_MEMORY_DIR = _pathlib.Path.home() / '.latti' / 'memory'
+
+
+def _memory_key_path(key: str) -> _pathlib.Path:
+    # Sanitize key to safe filename
+    safe = _re.sub(r'[^a-zA-Z0-9_\-.]', '_', key)
+    if not safe:
+        raise ToolExecutionError('memory key must be non-empty')
+    return _MEMORY_DIR / f'{safe}.md'
+
+
+def _memory_write(arguments: dict[str, Any], context: ToolExecutionContext) -> str:
+    key     = arguments.get('key', '').strip()
+    content = arguments.get('content', '')
+    append  = arguments.get('append', False)
+
+    p = _memory_key_path(key)
+    _MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+
+    if append and p.exists():
+        existing = p.read_text(encoding='utf-8')
+        p.write_text(existing + '\n' + content, encoding='utf-8')
+        return f'appended to memory:{key} ({p.stat().st_size} bytes total)'
+    else:
+        p.write_text(content, encoding='utf-8')
+        return f'wrote memory:{key} ({len(content)} bytes)'
+
+
+def _memory_read(arguments: dict[str, Any], context: ToolExecutionContext) -> str:
+    key = arguments.get('key', '').strip()
+    p   = _memory_key_path(key)
+    if not p.exists():
+        return f'memory:{key} — not found'
+    return p.read_text(encoding='utf-8')
+
+
+def _memory_list(arguments: dict[str, Any], context: ToolExecutionContext) -> str:
+    _MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+    keys = sorted(p.stem for p in _MEMORY_DIR.glob('*.md'))
+    if not keys:
+        return 'no memory entries'
+    return '\n'.join(keys)

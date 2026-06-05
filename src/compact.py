@@ -17,7 +17,7 @@ Mirrors the npm ``src/services/compact/compact.ts`` and
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
 from .agent_context_usage import estimate_tokens
@@ -504,9 +504,21 @@ def compact_conversation(
         getattr(agent.runtime_config, 'compact_preserve_messages', 4), 1
     )
 
+    # Identify the prefix count: previous compaction artifacts at the
+    # head of the session that must NOT be re-summarized. We protect
+    # both 'compact_boundary' and 'compact_summary' messages — without
+    # this, every additional compaction would re-summarize the previous
+    # summaries into a single increasingly-blurry one (compound blur,
+    # exponential information loss). With this, successive compactions
+    # produce a chronological stack of summaries: oldest first, newest
+    # last, then anchored mission/correction messages, then verbatim
+    # tail. This is the message-layer analog of DeepSeek's HCA layers
+    # — heavily compressed history preserved (not re-compressed) when
+    # the model revisits.
+    _PROTECTED_PREFIX_KINDS = {'compact_boundary', 'compact_summary'}
     prefix_count = 0
     for msg in session.messages:
-        if msg.metadata.get('kind') == 'compact_boundary':
+        if msg.metadata.get('kind') in _PROTECTED_PREFIX_KINDS:
             prefix_count += 1
         else:
             break
@@ -515,14 +527,63 @@ def compact_conversation(
     tail_count = min(preserve_count, max(total - prefix_count, 0))
     compact_end = total - tail_count
 
+    # 2026-04-27: orphan-tool_result fix (re-applied after refactor reverted).
+    # Walk compact_end forward past any leading tool_result messages so the
+    # preserved tail never starts with an orphan. Handles 3 shapes:
+    # role='tool', role='user' + tool_call_id, role='user' + content[*].type='tool_result'.
+    def _msg_is_tool_result(m) -> bool:
+        if m.role == 'tool':
+            return True
+        if m.role == 'user' and m.tool_call_id is not None:
+            return True
+        if m.role == 'user' and m.blocks:
+            for block in m.blocks:
+                if isinstance(block, dict) and block.get('type') == 'tool_result':
+                    return True
+        return False
+
+    while compact_end < total and _msg_is_tool_result(session.messages[compact_end]):
+        compact_end += 1
+
+    # Symmetric pair integrity (atomic tool-pair compaction).
+    # The walk above only handles tool_result AT the boundary cut. When
+    # a non-tool-result message intervenes — e.g. assistant_tool_use →
+    # user (interjection) → tool_result — the walk misses it, the
+    # assistant_tool_use folds into the summary, and the tool_result
+    # becomes an orphan in the preserved tail (later 400'd by Anthropic).
+    # Track open tool_use IDs in candidates and extend compact_end forward
+    # by ID match, absorbing intervening messages, until every tool_use
+    # in candidates has its tool_result alongside it.
+    open_ids = _collect_open_tool_use_ids(session.messages[prefix_count:compact_end])
+    while open_ids and compact_end < total:
+        m = session.messages[compact_end]
+        compact_end += 1
+        if m.role == 'assistant' and m.tool_calls:
+            for tc in m.tool_calls:
+                if isinstance(tc, dict) and isinstance(tc.get('id'), str):
+                    open_ids.add(tc['id'])
+        elif _msg_is_tool_result(m):
+            cid = _tool_call_id_of(m)
+            if cid is not None:
+                open_ids.discard(cid)
+
     if compact_end <= prefix_count:
         return CompactionResult(
             boundary_message=_build_boundary('Not enough messages after prefix.'),
             error=ERROR_NOT_ENOUGH_MESSAGES,
         )
 
-    candidates = list(session.messages[prefix_count:compact_end])
+    candidates_with_anchors = session.messages[prefix_count:compact_end]
     preserved_tail = list(session.messages[compact_end:])
+
+    # Anchor sinks: messages flagged metadata['anchor']=True are excluded
+    # from the summarizer input AND survive the rebuild verbatim. Mission
+    # directives, hard user corrections, and load-bearing decisions get
+    # the same persistent-attention guarantee that DeepSeek V4's sink
+    # logits provide at the transformer layer. Tested by
+    # tests/test_compact_anchors.py.
+    anchored = [m for m in candidates_with_anchors if _is_anchor(m)]
+    candidates = [m for m in candidates_with_anchors if not _is_anchor(m)]
 
     if not candidates:
         return CompactionResult(
@@ -614,10 +675,13 @@ def compact_conversation(
         metadata={'kind': 'compact_summary', 'is_compact_summary': True},
     )
 
-    # Replace session messages in-place
+    # Replace session messages in-place. Anchors (if any) sit AFTER the
+    # boundary+summary and BEFORE the preserved tail, so they read like
+    # persistent system reminders that survive every compaction cycle.
     session.messages = (
         session.messages[:prefix_count]
         + [boundary, summary_msg]
+        + anchored
         + preserved_tail
     )
 
@@ -643,6 +707,61 @@ def compact_conversation(
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _tool_call_id_of(msg: AgentMessage) -> str | None:
+    """Best-effort extraction of the tool_call_id from a tool-result message.
+
+    Handles the three persisted shapes:
+      - role='tool' with tool_call_id field
+      - role='user' with tool_call_id field
+      - role='user' with blocks=[{'type':'tool_result','tool_call_id':...}]
+    """
+    if msg.tool_call_id is not None:
+        return msg.tool_call_id
+    if msg.role == 'user' and msg.blocks:
+        for block in msg.blocks:
+            if isinstance(block, dict) and block.get('type') == 'tool_result':
+                cid = block.get('tool_call_id') or block.get('tool_use_id')
+                if isinstance(cid, str):
+                    return cid
+    return None
+
+
+def _collect_open_tool_use_ids(msgs: list[AgentMessage]) -> set[str]:
+    """Tool_use ids announced by assistants in `msgs` whose matching
+    tool_result is NOT also in `msgs` — i.e. unsatisfied pairs that would
+    leave an orphan if the tail were cut here.
+    """
+    open_ids: set[str] = set()
+    for m in msgs:
+        if m.role == 'assistant' and m.tool_calls:
+            for tc in m.tool_calls:
+                if isinstance(tc, dict) and isinstance(tc.get('id'), str):
+                    open_ids.add(tc['id'])
+        else:
+            cid = _tool_call_id_of(m)
+            if cid is not None:
+                open_ids.discard(cid)
+    return open_ids
+
+
+def _is_anchor(msg: AgentMessage) -> bool:
+    """True if a message is marked as an anchor sink (never compacted)."""
+    return msg.metadata.get('anchor') is True
+
+
+def mark_as_anchor(msg: AgentMessage) -> AgentMessage:
+    """Return a copy of `msg` with metadata['anchor']=True.
+
+    Use for mission directives, persistent user corrections, and
+    load-bearing decisions that must survive every compaction. Anchors
+    are excluded from the summarizer input and re-spliced verbatim into
+    the post-compact session immediately after the summary.
+    """
+    new_meta = dict(msg.metadata)
+    new_meta['anchor'] = True
+    return replace(msg, metadata=new_meta)
+
 
 def _build_boundary(note: str) -> AgentMessage:
     """Create a compact-boundary system message."""

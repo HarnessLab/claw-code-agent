@@ -20,7 +20,7 @@ class BenchmarkTempWorkspaceTests(unittest.TestCase):
             try:
                 workspace_path = Path(workspace)
                 self.assertTrue(workspace_path.is_dir())
-                self.assertEqual(workspace_path.parent, Path(tmp_dir))
+                self.assertEqual(workspace_path.parent.resolve(), Path(tmp_dir).resolve())
                 self.assertNotIn("/", workspace_path.name)
                 self.assertIn("HumanEval_0", workspace_path.name)
             finally:

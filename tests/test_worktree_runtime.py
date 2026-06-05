@@ -61,7 +61,7 @@ class WorktreeRuntimeTests(unittest.TestCase):
         self.assertTrue(worktree_path.exists())
         self.assertIn('feature-preview', enter_report.worktree_branch or '')
         self.assertFalse(exit_report.active)
-        self.assertEqual(exit_report.original_cwd, str(workspace))
+        self.assertEqual(Path(exit_report.original_cwd or '').resolve(), workspace.resolve())
 
     def test_worktree_tools_execute_against_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -184,4 +184,3 @@ class WorktreeRuntimeTests(unittest.TestCase):
         self.assertFalse((workspace / 'note.txt').exists())
         self.assertTrue((worktree_path / 'note.txt').exists())
         self.assertEqual(agent.runtime_config.cwd, worktree_path.resolve())
-

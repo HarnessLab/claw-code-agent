@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import subprocess
 import sys
 from pathlib import Path
 from dataclasses import replace
@@ -60,6 +61,7 @@ from .session_store import (
     load_session,
 )
 from .setup import run_setup
+from .tui_supervisor import append_worker_event, run_background_turn, save_worker_result
 from .tool_pool import assemble_tool_pool
 from .tools import execute_tool, get_tool, get_tools, render_tool_index
 
@@ -92,6 +94,10 @@ def _add_agent_common_args(parser: argparse.ArgumentParser, *, include_backend: 
     parser.add_argument('--max-delegated-tasks', type=int)
     parser.add_argument('--max-model-calls', type=int)
     parser.add_argument('--max-session-turns', type=int)
+    parser.add_argument('--max-output-chars', type=int, default=50000)
+    parser.add_argument('--command-timeout', type=float,
+                        default=float(os.environ.get('LATTI_COMMAND_TIMEOUT', '120')),
+                        help='Bash/shell command timeout in seconds (default 120, env: LATTI_COMMAND_TIMEOUT)')
     parser.add_argument('--response-schema-file')
     parser.add_argument('--response-schema-name')
     parser.add_argument('--response-schema-strict', action='store_true')
@@ -105,6 +111,9 @@ def _build_runtime_config(args: argparse.Namespace) -> AgentRuntimeConfig:
     return AgentRuntimeConfig(
         cwd=Path(args.cwd).resolve(),
         max_turns=getattr(args, 'max_turns', 12),
+        max_output_chars=getattr(args, 'max_output_chars', 50000),
+        command_timeout_seconds=float(getattr(args, 'command_timeout', None) or
+                                      os.environ.get('LATTI_COMMAND_TIMEOUT', '120')),
         permissions=AgentPermissions(
             allow_file_write=args.allow_write,
             allow_shell_commands=args.allow_shell,
@@ -348,7 +357,30 @@ def _run_background_worker(args: argparse.Namespace) -> int:
     session_path = None
     try:
         agent = _build_agent(args)
-        result = agent.run(args.prompt)
+        agent.runtime_event_sink = lambda event: append_worker_event(
+            background_runtime.root,
+            args.background_id,
+            event,
+        )
+        result = _execute_agent_turn(
+            agent,
+            args.prompt,
+            active_session_id=getattr(args, 'resume_session_id', None),
+        )
+        # Smoke-only hook: simulate a worker that completed the LLM turn
+        # (so the session checkpoint at SESSION_DIR/<id>.json is on disk)
+        # but exited before writing its result file. The parent's
+        # run_background_turn → synthesize_worker_failure_result path then
+        # produces the "Worker exited before returning a result" message
+        # the supervisor smoke harness asserts on.
+        # Tested by scripts/smoke_latti_supervisor.py.
+        if os.environ.get('LATTI_SUPERVISOR_SMOKE_FAIL_AFTER_SESSION') == '1':
+            session_id = result.session_id
+            session_path = result.session_path
+            stop_reason = 'smoke_forced_worker_failure'
+            exit_code = 1
+            return 1
+        save_worker_result(background_runtime.root, args.background_id, result)
         _print_agent_result(result, show_transcript=args.show_transcript)
         exit_code = 0
         stop_reason = result.stop_reason or 'completed'
@@ -511,28 +543,194 @@ def _build_resumed_agent(args: argparse.Namespace) -> tuple[LocalCodingAgent, St
     return agent, stored_session
 
 
-def _print_agent_result(result, *, show_transcript: bool) -> None:
-    print(result.final_output)
-    print('\n# Usage')
-    print(f'total_tokens={result.usage.total_tokens}')
-    print(f'input_tokens={result.usage.input_tokens}')
-    print(f'output_tokens={result.usage.output_tokens}')
-    print(f'total_cost_usd={result.total_cost_usd:.6f}')
-    if result.stop_reason:
-        print(f'stop_reason={result.stop_reason}')
-    if result.session_id:
-        print('\n# Session')
-        print(f'session_id={result.session_id}')
-        if result.session_path:
-            print(f'session_path={result.session_path}')
-    if result.scratchpad_directory:
-        print(f'scratchpad_directory={result.scratchpad_directory}')
+def _print_agent_result(result, *, show_transcript: bool, chat_mode: bool = False) -> None:
+    # If streaming was active, tokens were already printed live — just add a newline
+    streamed = any(e.get('type') == 'content_delta' for e in result.events)
+    if streamed:
+        print()  # newline after streamed output
+    else:
+        print(result.final_output)
+    if not chat_mode:
+        print('\n# Usage')
+        print(f'total_tokens={result.usage.total_tokens}')
+        print(f'input_tokens={result.usage.input_tokens}')
+        print(f'output_tokens={result.usage.output_tokens}')
+        print(f'total_cost_usd={result.total_cost_usd:.6f}')
+        if result.stop_reason:
+            print(f'stop_reason={result.stop_reason}')
+        if result.session_id:
+            print('\n# Session')
+            print(f'session_id={result.session_id}')
+            if result.session_path:
+                print(f'session_path={result.session_path}')
+        if result.scratchpad_directory:
+            print(f'scratchpad_directory={result.scratchpad_directory}')
     if show_transcript:
         print('\n# Transcript')
         for message in result.transcript:
             role = message.get('role', 'unknown')
             print(f'[{role}]')
             print(message.get('content', ''))
+
+
+def _execute_agent_turn(
+    agent: LocalCodingAgent,
+    prompt: str,
+    *,
+    active_session_id: str | None,
+    info_callback: Callable[[str], None] | None = None,
+    thinking_start: Callable[[], None] | None = None,
+    thinking_clear: Callable[[], None] | None = None,
+) -> AgentRunResult:
+    def _invoke(action: Callable[[], AgentRunResult]) -> AgentRunResult:
+        if thinking_start is not None:
+            thinking_start()
+        try:
+            return action()
+        finally:
+            if thinking_clear is not None:
+                thinking_clear()
+
+    if active_session_id:
+        try:
+            stored_session = load_agent_session(
+                active_session_id,
+                directory=agent.runtime_config.session_directory,
+            )
+            _stored_cost = getattr(stored_session, 'total_cost_usd', 0.0)
+            import os as _os_m
+            _raw = _os_m.environ.get('LATTI_SAFETY_MAX_COST_USD', '').strip()
+            try:
+                _safety_ceiling = float(_raw) if _raw else 0.0
+            except ValueError:
+                _safety_ceiling = 0.0
+            _stored_usage = getattr(stored_session, 'usage', None) or {}
+            _stored_input_tokens = (
+                _stored_usage.get('input_tokens', 0) if isinstance(_stored_usage, dict)
+                else getattr(_stored_usage, 'input_tokens', 0)
+            )
+            _context_limit = 192_000
+            _over_budget = False
+            _over_context = _stored_input_tokens > _context_limit
+            if _over_budget:
+                if info_callback is not None:
+                    info_callback(
+                        f'session {active_session_id[:12]} reset — '
+                        f'cost ${_stored_cost:.2f} >= ${_safety_ceiling:.2f} '
+                        '— starting fresh'
+                    )
+                _persist_last_session(None)
+                return _invoke(lambda: agent.run(prompt))
+            if _over_context:
+                from .session_compact import compact_stored_session
+
+                compacted, dropped = compact_stored_session(stored_session)
+                if info_callback is not None and dropped > 0:
+                    new_tokens = int(compacted.usage.get('input_tokens', 0) or 0)
+                    info_callback(
+                        f'session {active_session_id[:12]} compacted — '
+                        f'{_stored_input_tokens:,} tok → {new_tokens:,} tok '
+                        f'({dropped} earliest messages elided; continuity preserved)'
+                    )
+                return _invoke(lambda: agent.resume(prompt, compacted))
+            return _invoke(lambda: agent.resume(prompt, stored_session))
+        except (FileNotFoundError, KeyError, json.JSONDecodeError):
+            _persist_last_session(None)
+            return _invoke(lambda: agent.run(prompt))
+    return _invoke(lambda: agent.run(prompt))
+
+
+def _build_background_chat_worker_runner(
+    args: argparse.Namespace,
+) -> Callable[[str, str | None], AgentRunResult]:
+    background_runtime = BackgroundSessionRuntime()
+    forwarded_args: list[str] = []
+    _append_agent_forwarded_args(forwarded_args, args, include_backend=True)
+    forwarded_args.extend(['--background-root', str(background_runtime.root)])
+    process_cwd = Path(__file__).resolve().parent.parent
+    workspace_cwd = Path(args.cwd).resolve()
+
+    def _worker_runner(prompt: str, resume_session_id: str | None) -> AgentRunResult:
+        background_id = background_runtime.create_id()
+        command = build_background_worker_command(
+            background_id=background_id,
+            prompt=prompt,
+            forwarded_args=forwarded_args,
+            resume_session_id=resume_session_id,
+        )
+        final_record, result = run_background_turn(
+            background_runtime,
+            launch_worker=lambda: background_runtime.launch(
+                command,
+                prompt=prompt,
+                workspace_cwd=workspace_cwd,
+                model=args.model,
+                mode='chat',
+                background_id=background_id,
+                process_cwd=process_cwd,
+            ),
+            on_event=getattr(_worker_runner, 'on_event', None),
+        )
+        if final_record.session_id and not result.session_id:
+            result = replace(result, session_id=final_record.session_id)
+        if final_record.session_path and not result.session_path:
+            result = replace(result, session_path=final_record.session_path)
+        return result
+
+    return _worker_runner
+
+
+def _render_worker_event_to_tui(
+    event: dict[str, object],
+    *,
+    tui,
+    stream_renderer,
+):
+    event_type = event.get('type')
+    if event_type == 'content_delta':
+        delta = event.get('delta')
+        if isinstance(delta, str) and delta:
+            if stream_renderer is None:
+                stream_renderer = tui.StreamRenderer()
+                stream_renderer.start()
+            stream_renderer.token(delta)
+    elif event_type == 'tool_start':
+        tool_name = event.get('tool_name')
+        detail = event.get('detail')
+        if isinstance(tool_name, str):
+            tui.tool_start(tool_name, detail if isinstance(detail, str) else '')
+    elif event_type == 'tool_result':
+        tool_name = event.get('tool_name')
+        content = event.get('content')
+        if isinstance(tool_name, str):
+            tui.tool_result(tool_name, content if isinstance(content, str) else '')
+    elif event_type == 'state_machine_decision':
+        action_kind = event.get('action_kind')
+        rationale = event.get('rationale')
+        if isinstance(action_kind, str):
+            reason = rationale if isinstance(rationale, str) else ''
+            if reason.startswith('rule_fired: '):
+                reason = reason.removeprefix('rule_fired: ')
+            tui.info(f'state-machine: {action_kind} - {reason}'.rstrip())
+    elif event_type == 'session_checkpoint':
+        session_id = event.get('session_id')
+        typed_saved = event.get('typed_state_checkpointed') is True
+        if isinstance(session_id, str) and session_id:
+            status = 'typed-state saved' if typed_saved else 'session saved'
+            tui.info(f'checkpoint: {session_id[:12]} {status}')
+    elif event_type == 'state_machine_evaluation':
+        # Telemetry-only: surfaces evaluator verdicts without altering control
+        # flow. v2 will let 'replan'/'done' verdicts drive transitions.
+        evaluator = event.get('evaluator')
+        verdict = event.get('verdict')
+        note = event.get('note')
+        if isinstance(evaluator, str) and isinstance(verdict, str):
+            # Suppress the noisy 'continue' verdict — only show non-default
+            # verdicts (replan, done, escalate, timeout).
+            if verdict != 'continue':
+                detail = f' — {note}' if isinstance(note, str) and note else ''
+                tui.info(f'evaluator {evaluator}: {verdict}{detail}'.rstrip())
+    return stream_renderer
 
 
 def _run_agent_chat_loop(
@@ -544,46 +742,489 @@ def _run_agent_chat_loop(
     input_func: Callable[[str], str] = input,
     output_func: Callable[[str], None] = print,
     result_printer: Callable[..., None] = _print_agent_result,
+    worker_runner: Callable[[str, str | None], AgentRunResult] | None = None,
 ) -> int:
     active_session_id = resume_session_id
     first_prompt = initial_prompt
 
-    output_func('# Agent Chat')
-    output_func("Enter a prompt. Use '/exit' or '/quit' to stop.")
-    if active_session_id:
-        output_func(f'resuming_session_id={active_session_id}')
+    # Auto-boot: if LATTI_BOOT is set and no explicit prompt, generate one
+    # This is Latti's equivalent of Claude Code's SessionStart hook
+    if os.environ.get('LATTI_BOOT', '0') == '1' and first_prompt is None and not active_session_id:
+        first_prompt = (
+            'Boot. Systems checked. Act on what needs attention — '
+            'check pending picks, score settled games, handle errors. '
+            'Report status in 2-3 lines, then wait for my direction.'
+        )
+
+    # Initialize TUI state
+    _git_branch = ''
+    try:
+        import subprocess as _sp
+        _git_branch = _sp.check_output(
+            ['git', 'branch', '--show-current'],
+            cwd=str(agent.runtime_config.cwd),
+            stderr=_sp.DEVNULL,
+            text=True,
+        ).strip()
+    except Exception:
+        pass
+
+    cumulative_input_tokens = 0
+    cumulative_output_tokens = 0
+    turn_count = 0
+
+    # Use TUI only for an actual interactive terminal. Piped smoke tests and
+    # non-TTY launches cannot support termios raw mode; fall back to plain
+    # input/output instead of throwing termios.error at tui.prompt().
+    tui = None
+    tui_heal = None
+    use_tui = (
+        input_func is input
+        and output_func is print
+        and sys.stdin.isatty()
+        and sys.stdout.isatty()
+        and os.environ.get('LATTI_DISABLE_TUI') != '1'
+    )
+
+    if use_tui:
+        from . import tui
+        tui.banner()
+        from . import tui_heal
+        tui_heal.install()  # SIGWINCH flag + sanitizer + cursor_guard + heal()
+        tui.set_state(
+            model=agent.model_config.model,
+            cwd=str(agent.runtime_config.cwd),
+            branch=_git_branch,
+            context_pct=0,
+            permissions='full access' if agent.runtime_config.permissions.allow_destructive_shell_commands
+                else 'write + shell' if agent.runtime_config.permissions.allow_shell_commands
+                else 'write' if agent.runtime_config.permissions.allow_file_write
+                else 'read-only',
+        )
+        if active_session_id:
+            tui.info(f'resuming session {active_session_id[:12]}...')
+        # Run boot actions visibly in the TUI (code, not model)
+        if os.environ.get('LATTI_BOOT', '0') == '1':
+            try:
+                from .latti_boot import _run_boot_services, _run_safe
+                svc = _run_boot_services()
+                if svc:
+                    tui.info(svc)
+                # Git status
+                git_status = _run_safe('cd ~/V5/claw-code-agent && git status --short 2>/dev/null')
+                if git_status:
+                    tui.info(f'git: {len(git_status.splitlines())} uncommitted changes')
+                # NBA dashboard one-liner
+                nba = _run_safe(
+                    'curl -s http://localhost:3737/api/dashboard 2>/dev/null | '
+                    'python3 -c "import json,sys; d=json.load(sys.stdin); r=d[\'record\']; '
+                    'print(f\'NBA: ${d[\"balance\"]:.0f} | {r[\"wins\"]}-{r[\"losses\"]}-{r[\"pushes\"]} | {d[\"roi\"]}% ROI\')" 2>/dev/null'
+                )
+                if nba:
+                    tui.info(nba)
+                else:
+                    tui.info('NBA engine: offline')
+            except Exception:
+                pass
+    else:
+        output_func('# Agent Chat')
+        output_func("Enter a prompt. Use '/exit' or '/quit' to stop.")
 
     while True:
         if first_prompt is not None:
-            prompt = first_prompt
+            user_input = first_prompt
             first_prompt = None
         else:
             try:
-                prompt = input_func('user> ')
-            except EOFError:
-                output_func('chat_ended=eof')
+                if use_tui:
+                    # If a SIGWINCH arrived since the last turn, fully heal
+                    # the layout for the new terminal dimensions before
+                    # drawing the prompt.
+                    if tui_heal.sigwinch_pending():
+                        tui_heal.heal()
+                    tui_heal.cursor_guard()  # Layer 3: nudge cursor out of footer before raw mode
+                user_input = tui.prompt() if use_tui else input_func('user> ')
+            except (EOFError, KeyboardInterrupt):
+                if use_tui:
+                    tui_heal.uninstall()
+                    tui.cleanup()
+                else:
+                    output_func('chat_ended=eof')
                 return 0
-            except KeyboardInterrupt:
-                output_func('\nchat_ended=interrupt')
-                return 130
 
-        normalized = prompt.strip()
+        normalized = user_input.strip()
         if not normalized:
             continue
+        # Echo user message as pi-style highlighted band
+        if use_tui:
+            tui.user_message(normalized)
+
+        # --- Slash commands (intercepted before LLM) ---
+        if normalized.startswith('/'):
+            from .slash_commands import is_command, handle_command, CommandContext
+            if is_command(normalized):
+                _cmd_ctx = CommandContext(
+                    agent=agent,
+                    active_session_id=active_session_id,
+                    turn_count=turn_count,
+                    cumulative_cost=result.total_cost_usd if 'result' in dir() and result else 0.0,
+                    cumulative_tokens=cumulative_input_tokens + cumulative_output_tokens,
+                    use_tui=use_tui,
+                    tui=tui if use_tui else None,
+                    tui_heal=tui_heal if use_tui else None,
+                    output_func=output_func,
+                    worker_supervisor_active=worker_runner is not None,
+                )
+                _cmd_result = handle_command(normalized, _cmd_ctx)
+                if _cmd_result.exit_session:
+                    if use_tui:
+                        tui_heal.uninstall()
+                        tui.cleanup()
+                        tui.info('goodbye')
+                    else:
+                        output_func('chat_ended=user_exit')
+                    return 0
+                if _cmd_result.new_session:
+                    active_session_id = None
+                    _persist_last_session(None)
+                continue  # don't send to LLM
+
         if normalized in {'/exit', '/quit'}:
-            output_func('chat_ended=user_exit')
+            if use_tui:
+                tui_heal.uninstall()
+                tui.cleanup()
+                tui.info('goodbye')
+            else:
+                output_func('chat_ended=user_exit')
             return 0
 
-        if active_session_id:
-            stored_session = load_agent_session(
-                active_session_id,
-                directory=agent.runtime_config.session_directory,
-            )
-            result = agent.resume(prompt, stored_session)
+        if worker_runner is not None:
+            worker_stream_renderer = None
+
+            def _on_worker_event(event: dict[str, object]) -> None:
+                nonlocal worker_stream_renderer
+                if not use_tui:
+                    return
+                worker_stream_renderer = _render_worker_event_to_tui(
+                    event,
+                    tui=tui,
+                    stream_renderer=worker_stream_renderer,
+                )
+
+            try:
+                setattr(worker_runner, 'on_event', _on_worker_event if use_tui else None)
+            except Exception:
+                pass
+            if use_tui:
+                tui.thinking_start()
+            try:
+                result = worker_runner(user_input, active_session_id)
+            finally:
+                if worker_stream_renderer is not None:
+                    worker_stream_renderer.end()
+                if use_tui:
+                    tui.thinking_clear()
         else:
-            result = agent.run(prompt)
-        result_printer(result, show_transcript=show_transcript)
+            result = _execute_agent_turn(
+                agent,
+                user_input,
+                active_session_id=active_session_id,
+                info_callback=tui.info if use_tui else None,
+                thinking_start=tui.thinking_start if use_tui else None,
+                thinking_clear=tui.thinking_clear if use_tui else None,
+            )
+        # Display result — call result_printer with chat_mode if supported
+        try:
+            result_printer(result, show_transcript=show_transcript, chat_mode=True)
+        except TypeError:
+            result_printer(result, show_transcript=show_transcript)
+        print()  # breathing room
         active_session_id = result.session_id
+        # Persist session ID for auto-resume on next launch
+        _persist_last_session(active_session_id)
+        # Track live session stats
+        turn_count += 1
+        cumulative_input_tokens += result.usage.input_tokens
+        cumulative_output_tokens += result.usage.output_tokens
+        # Context % = cumulative conversation tokens (excluding system prompt baseline) vs 200K
+        # Use cumulative tokens as a better measure of conversation length
+        conversation_tokens = cumulative_input_tokens + cumulative_output_tokens
+        ctx_pct = min(99, int(conversation_tokens * 100 / 200_000)) if conversation_tokens > 0 else 0
+        if use_tui:
+            tui.set_state(
+                context_pct=ctx_pct,
+                total_tokens=cumulative_input_tokens + cumulative_output_tokens,
+                turn_count=turn_count,
+                cost_usd=result.total_cost_usd,
+            )
+            tui.status_footer()  # redraw sticky footer with new data
+        # After rendering + persisting the turn, decide whether to run the
+        # optional post-turn hooks (auto-speak, self-sculpt). On macOS under
+        # compressor/wired pressure those hooks can push Python over jetsam;
+        # earlier this branch returned 75 (session-end) but that meant a
+        # memory-pressured machine could only ever run one query before
+        # latti exited. The session is already saved — we just skip the
+        # optional hooks and keep the chat loop running.
+        _safe_mb = _macos_safe_memory_mb() if use_tui else 999_999
+        _post_turn_threshold = int(os.environ.get('LATTI_POST_TURN_MIN_MB', '200'))
+        _already_low_mem = os.environ.get('LATTI_LOW_MEM') == '1'
+        _post_turn_action = _post_turn_memory_action(
+            safe_mb=_safe_mb,
+            threshold_mb=_post_turn_threshold,
+            already_low_mem=_already_low_mem,
+        )
+        if _post_turn_action == 'skip_hooks':
+            if not _already_low_mem and use_tui:
+                tui.info(
+                    f'low memory after turn — disabling voice/self-sculpt for '
+                    f'the rest of this session (session: {active_session_id[:12]})'
+                )
+                # Persist for subsequent turns AND any subprocesses we spawn.
+                os.environ['LATTI_LOW_MEM'] = '1'
+            _fired = []
+        else:
+            # Detect if the LLM called speak.sh this turn (via bash tool)
+            _detect_llm_spoke(result)
+            # Voice — speak first 2 sentences of response (skips if LLM already spoke)
+            _speak_response(result.final_output)
+            # Self-sculpt — evaluate AND mutate (zero tokens, real-time self-modification)
+            try:
+                from .self_sculpt import sculpt as _sculpt
+                _fired = _sculpt(result.final_output or '', agent=agent)
+            except Exception:
+                _fired = []
+        # === TURN COMPLETE — signal the human ===
+        if use_tui:
+            tui.done_marker()
+            # bell removed
+
+
+_LATTI_HOME = os.path.expanduser('~/.latti')
+_LAST_SESSION_FILE = os.path.join(_LATTI_HOME, 'last_session')
+
+
+def _persist_last_session(session_id: str | None) -> None:
+    """Write the active session ID to disk for auto-resume."""
+    if not session_id:
+        return
+    try:
+        os.makedirs(_LATTI_HOME, exist_ok=True)
+        with open(_LAST_SESSION_FILE, 'w') as f:
+            f.write(session_id)
+    except OSError:
+        pass
+
+
+def _load_last_session() -> str | None:
+    """Read the last session ID from disk."""
+    try:
+        with open(_LAST_SESSION_FILE, 'r') as f:
+            sid = f.read().strip()
+            return sid if sid else None
+    except (OSError, FileNotFoundError):
+        return None
+
+
+def _detect_llm_spoke(result) -> None:
+    """Scan the turn's transcript for bash tool calls containing speak.sh.
+
+    If the LLM intentionally called speak.sh via the bash tool this turn,
+    set _llm_spoke_this_turn so _speak_response skips auto-speak.
+    """
+    global _llm_spoke_this_turn
+    _llm_spoke_this_turn = False
+    # Scan transcript — assistant messages with tool_calls contain the command
+    for msg in getattr(result, 'transcript', ()):
+        role = msg.get('role', '')
+        if role != 'assistant':
+            continue
+        # Check tool_calls array (OpenAI format)
+        tool_calls = msg.get('tool_calls', ())
+        for tc in tool_calls:
+            fn = tc.get('function', {}) if isinstance(tc, dict) else {}
+            if fn.get('name') != 'bash':
+                continue
+            raw_args = fn.get('arguments', '')
+            if isinstance(raw_args, str) and 'speak' in raw_args:
+                _llm_spoke_this_turn = True
+                return
+            if isinstance(raw_args, dict) and 'speak' in str(raw_args.get('command', '')):
+                _llm_spoke_this_turn = True
+                return
+        # Also check content — some formats inline tool calls in content
+        content = msg.get('content', '')
+        if isinstance(content, str) and 'speak.sh' in content:
+            _llm_spoke_this_turn = True
+            return
+
+
+def _post_turn_memory_action(
+    *,
+    safe_mb: int,
+    threshold_mb: int,
+    already_low_mem: bool,
+) -> str:
+    """Decide what to do after a turn given current memory pressure.
+
+    Returns:
+      'continue'   — run optional post-turn hooks (voice TTS, self-sculpt)
+      'skip_hooks' — skip them; chat loop continues either way
+
+    Policy:
+      - If the wrapper already promoted us to low-mem mode → always skip.
+      - If safe RAM dropped strictly below threshold this turn → skip.
+      - Otherwise → continue normally.
+
+    Pure function. No side effects. Tested by tests/test_post_turn_memory.py.
+    """
+    if already_low_mem:
+        return 'skip_hooks'
+    if safe_mb < threshold_mb:
+        return 'skip_hooks'
+    return 'continue'
+
+
+def _macos_safe_memory_mb() -> int:
+    """Return conservative macOS safe-free memory in MB.
+
+    Mirrors the shell launcher guard: free + speculative + purgeable pages.
+    Do NOT count inactive pages; under heavy compressor/wired pressure they
+    did not prevent jetsam from SIGKILLing the Python/TUI process.
+    Non-macOS or parse failure returns a large sentinel so hooks proceed.
+    """
+    if sys.platform != 'darwin':
+        return 10**9
+    try:
+        import re
+        out = subprocess.check_output(['vm_stat'], text=True, timeout=2)
+        page_match = re.search(r'page size of (\d+) bytes', out)
+        if not page_match:
+            return 10**9
+        page_size = int(page_match.group(1))
+        vals: dict[str, int] = {}
+        for line in out.splitlines():
+            m = re.match(r'([^:]+):\s+([0-9]+)\.', line)
+            if m:
+                vals[m.group(1)] = int(m.group(2))
+        safe_pages = (
+            vals.get('Pages free', 0)
+            + vals.get('Pages speculative', 0)
+            + vals.get('Pages purgeable', 0)
+        )
+        return safe_pages * page_size // 1024 // 1024
+    except Exception:
+        return 10**9
+
+
+_last_speak_proc: subprocess.Popen | None = None
+# Track if the LLM called speak.sh this turn (via bash tool).
+# If so, skip auto-speak — the LLM composed voice text intentionally.
+_llm_spoke_this_turn: bool = False
+
+# Patterns that should NEVER be auto-spoken — compiled once at module load
+import re as _re_module
+_NEVER_SPEAK_PATTERNS = [
+    _re_module.compile(r'(?i)^(unable to|error:|failed|exception|traceback|ssl:)'),  # errors
+    _re_module.compile(r'(?i)^(ok\.|ok,|ok )'),  # fragments/status starts
+    _re_module.compile(r'(?i)^(here|let me|i\'ll|i will|starting|proceeding)'),  # action narration
+    _re_module.compile(r'(?i)(certificate|timeout|connection refused|api key|401|403|404|409|500)'),  # infra noise
+    _re_module.compile(r'(?i)^(fix \d|feat|chore|refactor)\b'),  # commit-message-like starts
+    _re_module.compile(r'^\s*[-*•]\s'),  # bullet lists
+    _re_module.compile(r'^\s*```'),  # code blocks
+    _re_module.compile(r'^\s*\|'),  # table rows
+]
+_SPEAK_LINE_SKIP = _re_module.compile(r'^[-*•]|^```|^\||^#+\s|^>\s')
+_SPEAK_SENTENCE_SPLIT = _re_module.compile(r'(?<=[.!?])\s+')
+_SPEAK_MARKDOWN_STRIP = _re_module.compile(r'[*_#`\[\]()]')
+_SPEAK_LEADING_STRIP = _re_module.compile(r'^[.\-–—…\s]+')
+
+
+def _speak_response(text: str) -> None:
+    """Speak the first 1-2 meaningful sentences via speak.sh (non-blocking).
+
+    Three guards prevent voice/chat mismatch:
+    1. If the LLM already called speak.sh this turn, skip (it composed voice intentionally)
+    2. Skip errors, infra noise, narration, fragments
+    3. Find the first real sentence, not just the first 2 tokens
+    """
+    global _last_speak_proc, _llm_spoke_this_turn
+    if os.environ.get('LATTI_LOW_MEM') == '1':
+        return
+    import re as _re
+
+    speak_script = os.path.expanduser('~/.claude/scripts/speak.sh')
+    if not os.path.isfile(speak_script):
+        return
+
+    # Guard 1: LLM already spoke this turn
+    if _llm_spoke_this_turn:
+        _llm_spoke_this_turn = False  # reset for next turn
+        return
+
+    if not text or not text.strip():
+        return
+
+    # Guard 2: Never speak error strings or infra noise (pre-compiled patterns)
+    first_line = text.strip().split('\n')[0]
+    for compiled_pat in _NEVER_SPEAK_PATTERNS:
+        if compiled_pat.search(first_line):
+            return
+
+    # Guard 3: Find first meaningful sentence(s), skipping fragments
+    lines = text.strip().split('\n')
+    meaningful_lines = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        if _SPEAK_LINE_SKIP.match(line):
+            continue
+        if len(line) < 20 and not any(c in line for c in '.!?'):
+            continue
+        meaningful_lines.append(line)
+        if len(meaningful_lines) >= 3:
+            break
+
+    if not meaningful_lines:
+        return
+
+    # Join and extract first 2 proper sentences
+    combined = ' '.join(meaningful_lines)
+    sentences = _SPEAK_SENTENCE_SPLIT.split(combined)
+    snippet = ' '.join(sentences[:2])[:250]
+
+    # Strip markdown formatting for cleaner speech
+    snippet = _SPEAK_MARKDOWN_STRIP.sub('', snippet).strip()
+    snippet = _SPEAK_LEADING_STRIP.sub('', snippet).strip()
+
+    if not snippet or len(snippet) < 10:
+        return
+
+    # Guard 4: Reject incomplete sentences (fragments, trailing ellipsis, setup without landing)
+    # Complete sentences end with . ! ? and don't trail off with ... or [incomplete]
+    if snippet.endswith(('...', '—', '–', '—\n', '[', '(')):
+        return
+    if not any(snippet.endswith(p) for p in '.!?'):
+        # If no terminal punctuation, reject (likely a fragment or setup)
+        return
+
+    # Kill previous auto-speak only (not LLM-initiated speaks)
+    if _last_speak_proc is not None:
+        try:
+            _last_speak_proc.kill()
+            _last_speak_proc.wait(timeout=1)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        _last_speak_proc = None
+
+    try:
+        _last_speak_proc = subprocess.Popen(
+            ['bash', speak_script, snippet],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError:
+        pass
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -850,6 +1491,7 @@ def build_parser() -> argparse.ArgumentParser:
     background_worker_parser = subparsers.add_parser('agent-bg-worker', help=argparse.SUPPRESS)
     background_worker_parser.add_argument('background_id')
     background_worker_parser.add_argument('prompt')
+    background_worker_parser.add_argument('--resume-session-id')
     background_worker_parser.add_argument('--background-root', required=True)
     background_worker_parser.add_argument('--max-turns', type=int, default=12)
     background_worker_parser.add_argument('--show-transcript', action='store_true')
@@ -882,6 +1524,7 @@ def build_parser() -> argparse.ArgumentParser:
     daemon_worker_parser = daemon_subparsers.add_parser('worker', help=argparse.SUPPRESS)
     daemon_worker_parser.add_argument('background_id')
     daemon_worker_parser.add_argument('prompt')
+    daemon_worker_parser.add_argument('--resume-session-id')
     daemon_worker_parser.add_argument('--background-root', required=True)
     daemon_worker_parser.add_argument('--max-turns', type=int, default=12)
     daemon_worker_parser.add_argument('--show-transcript', action='store_true')
@@ -1548,12 +2191,34 @@ def main(argv: list[str] | None = None) -> int:
                 print(f'exit_code={record.exit_code}')
             return 0
     if args.command == 'agent-chat':
+        # Latti boot hook: gather system state and inject into prompt
+        if os.environ.get('LATTI_BOOT', '0') == '1':
+            try:
+                from .latti_boot import gather_boot_context
+                boot_ctx = gather_boot_context()
+                if boot_ctx and args.append_system_prompt:
+                    args.append_system_prompt = args.append_system_prompt + '\n\n' + boot_ctx
+                elif boot_ctx:
+                    args.append_system_prompt = boot_ctx
+            except Exception:
+                pass  # boot hook failure is non-fatal
         agent = _build_agent(args)
+        worker_runner = None
+        supervisor_mode = os.environ.get('LATTI_USE_CHAT_SUPERVISOR', '1')
+        supervisor_forced = (
+            os.environ.get('LATTI_FORCE_CHAT_SUPERVISOR') == '1'
+            or supervisor_mode.lower() == 'force'
+        )
+        supervisor_allowed = supervisor_mode != '0'
+        supervisor_terminal_ready = sys.stdin.isatty() and sys.stdout.isatty()
+        if supervisor_allowed and (supervisor_forced or supervisor_terminal_ready):
+            worker_runner = _build_background_chat_worker_runner(args)
         return _run_agent_chat_loop(
             agent,
             initial_prompt=args.prompt,
             resume_session_id=args.resume_session_id,
             show_transcript=args.show_transcript,
+            worker_runner=worker_runner,
         )
     if args.command == 'agent-resume':
         agent, stored_session = _build_resumed_agent(args)

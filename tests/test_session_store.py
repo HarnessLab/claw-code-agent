@@ -87,6 +87,7 @@ class TestStoredAgentSessionRoundTrip(unittest.TestCase):
             'file_history': ({'file': 'a.py', 'action': 'edit'},),
             'budget_state': {'remaining': 100},
             'plugin_state': {'key': 'value'},
+            'typed_state': {'session_id': 'agent-001', 'turn_id': 'turn_1'},
             'scratchpad_directory': '/scratch/pad',
         }
         defaults.update(overrides)
@@ -113,6 +114,7 @@ class TestStoredAgentSessionRoundTrip(unittest.TestCase):
         self.assertEqual(loaded.file_history, session.file_history)
         self.assertEqual(loaded.budget_state, session.budget_state)
         self.assertEqual(loaded.plugin_state, session.plugin_state)
+        self.assertEqual(loaded.typed_state, session.typed_state)
         self.assertEqual(loaded.scratchpad_directory, session.scratchpad_directory)
 
     def test_round_trip_no_scratchpad(self) -> None:
@@ -182,6 +184,7 @@ class TestStoredAgentSessionRoundTrip(unittest.TestCase):
         self.assertEqual(loaded.file_history, ())
         self.assertEqual(loaded.budget_state, {})
         self.assertEqual(loaded.plugin_state, {})
+        self.assertEqual(loaded.typed_state, {})
         self.assertIsNone(loaded.scratchpad_directory)
 
     def test_load_non_dict_budget_state_defaults_to_empty(self) -> None:

@@ -115,6 +115,7 @@ class AssistantTurn:
     finish_reason: str | None = None
     raw_message: JSONDict = field(default_factory=dict)
     usage: UsageStats = field(default_factory=UsageStats)
+    thinking: str = ''  # Extended thinking from o1/o3 models
 
 
 @dataclass(frozen=True)

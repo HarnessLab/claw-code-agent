@@ -338,16 +338,20 @@ def build_background_worker_command(
     background_id: str,
     prompt: str,
     forwarded_args: list[str],
+    resume_session_id: str | None = None,
 ) -> list[str]:
-    return [
+    command = [
         sys.executable,
         '-m',
         'src.main',
         'agent-bg-worker',
         background_id,
         prompt,
-        *forwarded_args,
     ]
+    if resume_session_id:
+        command.extend(['--resume-session-id', resume_session_id])
+    command.extend(forwarded_args)
+    return command
 
 
 def _is_process_running(pid: int) -> bool:

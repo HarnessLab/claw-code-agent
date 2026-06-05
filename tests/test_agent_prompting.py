@@ -41,7 +41,15 @@ class AgentPromptingTests(unittest.TestCase):
 
     def test_session_state_exports_messages_in_order(self) -> None:
         state = AgentSessionState.create(['sys one', 'sys two'], 'hello')
-        state.append_assistant('working', ())
+        # The tool result with tool_call_id='call_1' must have a matching
+        # tool_call on the preceding assistant turn — otherwise
+        # `_strip_orphan_tool_results` filters it out before export.
+        state.append_assistant(
+            'working',
+            (
+                {'id': 'call_1', 'function': {'name': 'read_file', 'arguments': '{}'}},
+            ),
+        )
         state.append_tool('read_file', 'call_1', '{"ok": true}')
         messages = state.to_openai_messages()
         self.assertEqual(messages[0]['role'], 'system')

@@ -101,10 +101,30 @@ _BUILTIN_PROBLEMS: list[dict[str, Any]] = [
 
 
 def _extract_number(text: str) -> str | None:
-    """Extract the last number from a text string."""
-    text = text.replace(",", "").replace("$", "").strip()
-    # Find all numbers (including decimals and negatives)
-    numbers = re.findall(r"-?\d+\.?\d*", text)
+    """Extract the final numeric answer from agent output.
+
+    Only fires when the output looks like a real model response, not an
+    error message.  This prevents backend error noise (e.g. 'total_tokens=0')
+    from being mistaken for math answers.
+    """
+    # Bail on known error patterns before extracting
+    if any(marker in text for marker in [
+        'backend_error', 'HTTP 4', 'HTTP 5', 'stop_reason=', 'total_tokens=',
+        '401', '403', '404', '500', 'Authentication', 'Invalid API',
+    ]):
+        return None
+
+    text = text.replace(',', '').replace('$', '').strip()
+    # Prefer answers after common answer markers
+    for marker in ['####', 'answer is', 'answer:', 'the answer', '= ', '==']:
+        idx = text.lower().rfind(marker)
+        if idx != -1:
+            tail = text[idx + len(marker):].strip()
+            numbers = re.findall(r'-?\d+\.?\d*', tail)
+            if numbers:
+                return numbers[0]
+    # Fall back to last number in text
+    numbers = re.findall(r'-?\d+\.?\d*', text)
     return numbers[-1] if numbers else None
 
 
