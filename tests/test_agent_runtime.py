@@ -2838,3 +2838,80 @@ class AgentRuntimeTests(unittest.TestCase):
                 result = agent.run('Hello')
         self.assertEqual(result.stop_reason, 'budget_exceeded')
         self.assertIn('model-call budget was exceeded', result.final_output)
+
+    def test_duplicate_tool_call_id_is_not_executed_twice(self) -> None:
+        """Regression test for issue #42: agent should not re-execute a tool_call_id it already completed."""
+        responses = [
+            # First turn: model requests tool with id 'call_dup'
+            {
+                'choices': [
+                    {
+                        'message': {
+                            'role': 'assistant',
+                            'content': '',
+                            'tool_calls': [
+                                {
+                                    'id': 'call_dup',
+                                    'type': 'function',
+                                    'function': {
+                                        'name': 'read_file',
+                                        'arguments': '{"path": "hello.txt"}',
+                                    },
+                                }
+                            ],
+                        },
+                        'finish_reason': 'tool_calls',
+                    }
+                ]
+            },
+            # Second turn: model again requests the SAME tool_call_id 'call_dup'
+            {
+                'choices': [
+                    {
+                        'message': {
+                            'role': 'assistant',
+                            'content': '',
+                            'tool_calls': [
+                                {
+                                    'id': 'call_dup',
+                                    'type': 'function',
+                                    'function': {
+                                        'name': 'read_file',
+                                        'arguments': '{"path": "hello.txt"}',
+                                    },
+                                }
+                            ],
+                        },
+                        'finish_reason': 'tool_calls',
+                    }
+                ]
+            },
+            # Third turn: final response
+            {
+                'choices': [
+                    {
+                        'message': {
+                            'role': 'assistant',
+                            'content': 'Done.',
+                        },
+                        'finish_reason': 'stop',
+                    }
+                ]
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            (workspace / 'hello.txt').write_text('hello world\n', encoding='utf-8')
+            with patch('src.openai_compat.request.urlopen', side_effect=make_urlopen_side_effect(responses)):
+                agent = LocalCodingAgent(
+                    model_config=ModelConfig(
+                        model='test-model',
+                        base_url='http://127.0.0.1:8000/v1',
+                    ),
+                    runtime_config=AgentRuntimeConfig(cwd=workspace),
+                )
+                result = agent.run('Inspect hello.txt')
+
+        self.assertEqual(result.final_output, 'Done.')
+        # The tool should only have been counted once because the duplicate was skipped
+        self.assertEqual(result.tool_calls, 1)

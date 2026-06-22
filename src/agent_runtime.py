@@ -492,6 +492,7 @@ class LocalCodingAgent:
         file_history = list(existing_file_history)
         stream_events: list[dict[str, object]] = []
         assistant_response_segments: list[str] = []
+        completed_tool_call_ids: set[str] = set()
         delegated_tasks = sum(
             1 for entry in file_history if entry.get('action') in ('delegate_agent', 'Agent')
         )
@@ -807,6 +808,13 @@ class LocalCodingAgent:
 
             for tool_call in turn.tool_calls:
                 assistant_response_segments.clear()
+                if tool_call.id in completed_tool_call_ids:
+                    session.append_tool(
+                        name=tool_call.name,
+                        tool_call_id=tool_call.id,
+                        content='[duplicate tool_call_id, already executed]',
+                    )
+                    continue
                 tool_calls += 1
                 if tool_call.name in ('Agent', 'delegate_agent'):
                     delegated_tasks += self._delegated_task_units(tool_call.arguments)
@@ -1045,6 +1053,7 @@ class LocalCodingAgent:
                     },
                     stop_reason='tool_completed',
                 )
+                completed_tool_call_ids.add(tool_call.id)
                 stream_events.append(
                     {
                         'type': 'tool_result',
