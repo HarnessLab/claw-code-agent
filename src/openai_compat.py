@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Iterator
 from urllib import error, request
 
@@ -131,6 +132,46 @@ def _build_response_format(
     }
 
 
+_TOOL_CALL_RE = re.compile(r'<tool_call>\s*(.*?)\s*</tool_call>', re.DOTALL)
+
+
+def extract_tool_calls_from_content(content: str) -> tuple[list[ToolCall], str]:
+    """Extract embedded <tool_call> blocks from content text (Qwen/Hermes format).
+
+    Some models (e.g. Qwen served without native function-calling support) emit
+    tool invocations as ``<tool_call>{...}</tool_call>`` blocks inside the
+    assistant content instead of the structured ``tool_calls`` field.  This
+    helper parses those blocks and returns the tool calls together with the
+    content string stripped of the ``<tool_call>`` blocks.
+
+    Returns ``(tool_calls, cleaned_content)``.
+    """
+    tool_calls: list[ToolCall] = []
+
+    def _replace(match: re.Match) -> str:  # type: ignore[type-arg]
+        raw_json = match.group(1)
+        try:
+            payload = json.loads(raw_json)
+        except json.JSONDecodeError:
+            return match.group(0)
+        if not isinstance(payload, dict):
+            return match.group(0)
+        name = payload.get('name')
+        if not isinstance(name, str) or not name:
+            return match.group(0)
+        arguments = payload.get('arguments') or payload.get('parameters') or {}
+        if not isinstance(arguments, dict):
+            arguments = {}
+        call_id = f'call_{len(tool_calls)}'
+        tool_calls.append(ToolCall(id=call_id, name=name, arguments=arguments))
+        return ''
+
+    cleaned = _TOOL_CALL_RE.sub(_replace, content)
+    if tool_calls:
+        cleaned = cleaned.strip()
+    return tool_calls, cleaned
+
+
 class OpenAICompatClient:
     """Minimal OpenAI-compatible chat client for local model servers."""
 
@@ -165,6 +206,12 @@ class OpenAICompatClient:
 
         content = _normalize_content(message.get('content'))
         tool_calls = self._parse_tool_calls_from_message(message)
+
+        # Fallback: some models (e.g. Qwen without native function-calling
+        # support) embed tool calls as <tool_call> blocks in the content.
+        if not tool_calls and content:
+            extracted, content = extract_tool_calls_from_content(content)
+            tool_calls = extracted
 
         finish_reason = first_choice.get('finish_reason')
         if finish_reason is not None and not isinstance(finish_reason, str):

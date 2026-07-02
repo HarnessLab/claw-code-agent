@@ -184,7 +184,89 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertEqual(turn.tool_calls[0].name, 'read_file')
         self.assertEqual(turn.tool_calls[0].arguments['path'], 'hello.txt')
 
-    def test_openai_client_streams_content_and_usage(self) -> None:
+    def test_openai_client_parses_tool_calls_from_content(self) -> None:
+        """Qwen/Hermes models may embed tool calls as <tool_call> blocks in content."""
+        tool_call_json = '{"name": "write_file", "arguments": {"path": "out.txt", "content": "hi"}}'
+        responses = [
+            {
+                'choices': [
+                    {
+                        'message': {
+                            'role': 'assistant',
+                            'content': f'<tool_call>\n{tool_call_json}\n</tool_call>',
+                        },
+                        'finish_reason': 'stop',
+                    }
+                ],
+                'usage': {'prompt_tokens': 10, 'completion_tokens': 20},
+            }
+        ]
+        with patch('src.openai_compat.request.urlopen', side_effect=make_urlopen_side_effect(responses)):
+            client = OpenAICompatClient(
+                ModelConfig(
+                    model='Qwen/Qwen3-Coder-30B-A3B-Instruct',
+                    base_url='http://127.0.0.1:8000/v1',
+                )
+            )
+            turn = client.complete(
+                messages=[{'role': 'user', 'content': 'write out.txt'}],
+                tools=[],
+            )
+        self.assertEqual(turn.content, '')
+        self.assertEqual(len(turn.tool_calls), 1)
+        self.assertEqual(turn.tool_calls[0].name, 'write_file')
+        self.assertEqual(turn.tool_calls[0].arguments['path'], 'out.txt')
+        self.assertEqual(turn.tool_calls[0].arguments['content'], 'hi')
+
+    def test_agent_executes_embedded_tool_calls_from_content(self) -> None:
+        """End-to-end: agent creates a file when the model uses <tool_call> content format."""
+        tool_call_json = '{"name": "write_file", "arguments": {"path": "out.txt", "content": "hello"}}'
+        responses = [
+            {
+                'choices': [
+                    {
+                        'message': {
+                            'role': 'assistant',
+                            'content': f'<tool_call>\n{tool_call_json}\n</tool_call>',
+                        },
+                        'finish_reason': 'stop',
+                    }
+                ],
+                'usage': {'prompt_tokens': 10, 'completion_tokens': 20},
+            },
+            {
+                'choices': [
+                    {
+                        'message': {
+                            'role': 'assistant',
+                            'content': 'Done.',
+                        },
+                        'finish_reason': 'stop',
+                    }
+                ],
+                'usage': {'prompt_tokens': 5, 'completion_tokens': 2},
+            },
+        ]
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            workspace = Path(tmp_dir)
+            with patch('src.openai_compat.request.urlopen', side_effect=make_urlopen_side_effect(responses)):
+                agent = LocalCodingAgent(
+                    model_config=ModelConfig(
+                        model='Qwen/Qwen3-Coder-30B-A3B-Instruct',
+                        base_url='http://127.0.0.1:8000/v1',
+                    ),
+                    runtime_config=AgentRuntimeConfig(
+                        cwd=workspace,
+                        permissions=AgentPermissions(allow_file_write=True),
+                    ),
+                )
+                result = agent.run('Create out.txt')
+            self.assertTrue((workspace / 'out.txt').exists())
+            self.assertEqual((workspace / 'out.txt').read_text(), 'hello')
+        self.assertEqual(result.final_output, 'Done.')
+        self.assertEqual(result.tool_calls, 1)
+
+
         responses = [
             [
                 {'choices': [{'delta': {'content': 'Hello '}, 'finish_reason': None}]},

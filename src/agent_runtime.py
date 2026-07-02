@@ -56,7 +56,7 @@ from .agent_types import (
     ToolExecutionResult,
     UsageStats,
 )
-from .openai_compat import OpenAICompatClient, OpenAICompatError
+from .openai_compat import OpenAICompatClient, OpenAICompatError, extract_tool_calls_from_content
 from .plan_runtime import PlanRuntime
 from .plugin_runtime import PluginRuntime
 from .remote_runtime import RemoteRuntime
@@ -1221,9 +1221,37 @@ class LocalCodingAgent:
             usage=usage,
         )
         assistant_message = session.messages[assistant_index]
+        turn_content = assistant_message.content
+        turn_tool_calls = self._tool_calls_from_message(assistant_message.tool_calls)
+
+        # Fallback: some models (e.g. Qwen without native function-calling
+        # support) embed tool calls as <tool_call> blocks in the content.
+        if not turn_tool_calls and turn_content:
+            extracted, cleaned_content = extract_tool_calls_from_content(turn_content)
+            if extracted:
+                turn_tool_calls = tuple(extracted)
+                turn_content = cleaned_content
+                openai_tool_calls = tuple(
+                    {
+                        'id': tc.id,
+                        'type': 'function',
+                        'function': {
+                            'name': tc.name,
+                            'arguments': json.dumps(tc.arguments, ensure_ascii=True),
+                        },
+                    }
+                    for tc in extracted
+                )
+                session.messages[assistant_index] = replace(
+                    assistant_message,
+                    content=cleaned_content,
+                    tool_calls=openai_tool_calls,
+                )
+                assistant_message = session.messages[assistant_index]
+
         turn = AssistantTurn(
-            content=assistant_message.content,
-            tool_calls=self._tool_calls_from_message(assistant_message.tool_calls),
+            content=turn_content,
+            tool_calls=turn_tool_calls,
             finish_reason=finish_reason,
             raw_message=assistant_message.to_openai_message(),
             usage=usage,
